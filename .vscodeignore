@@ -1,0 +1,12 @@
+.vscode/**
+.vscode-test/**
+out/**
+node_modules/**
+src/**
+.gitignore
+.yarnrc
+.eslintrc.json
+**/*.map
+**/*.ts
+*.js
+!dist/extension.js

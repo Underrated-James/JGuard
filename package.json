@@ -1,0 +1,95 @@
+{
+  "name": "jguard",
+  "displayName": "JGuard",
+  "description": "A safe checkpoint and rollback system for AI-generated code changes.",
+  "version": "0.0.1",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "jguard.toggleProtection",
+        "title": "JGuard: Toggle Protection",
+        "icon": "$(shield)"
+      },
+      {
+        "command": "jguard.toggleChanges",
+        "title": "JGuard: Toggle AI Changes",
+        "icon": "$(versions)"
+      },
+      {
+        "command": "jguard.acceptAll",
+        "title": "JGuard: Finalize (Keep Changes)",
+        "icon": "$(check)"
+      },
+      {
+        "command": "jguard.rejectAll",
+        "title": "JGuard: Discard (Revert & Close)",
+        "icon": "$(discard)"
+      },
+      {
+        "command": "jguard.refresh",
+        "title": "JGuard: Refresh",
+        "icon": "$(refresh)"
+      }
+    ],
+    "views": {
+      "explorer": [
+        {
+          "id": "jguardSidebar",
+          "name": "AI Guard"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "jguard.toggleChanges",
+          "when": "view == jguardSidebar",
+          "group": "navigation@1"
+        },
+        {
+          "command": "jguard.acceptAll",
+          "when": "view == jguardSidebar",
+          "group": "navigation@2"
+        },
+        {
+          "command": "jguard.rejectAll",
+          "when": "view == jguardSidebar",
+          "group": "navigation@3"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run package",
+    "compile": "npm run check-types && node esbuild.js",
+    "watch": "npm run check-types && node esbuild.js --watch",
+    "package": "npm run check-types && node esbuild.js --production",
+    "compile-tests": "tsc -p . --noEmit",
+    "watch-tests": "tsc -p . -w --noEmit",
+    "pretest": "npm run compile-tests && npm run compile",
+    "check-types": "tsc --noEmit",
+    "lint": "eslint src --ext ts",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@types/node": "20.x",
+    "@types/vscode": "^1.80.0",
+    "@typescript-eslint/eslint-plugin": "^7.0.0",
+    "@typescript-eslint/parser": "^7.0.0",
+    "esbuild": "^0.20.0",
+    "eslint": "^8.56.0",
+    "typescript": "^5.3.3",
+    "vitest": "^1.4.0",
+    "@vscode/test-electron": "^2.3.9"
+  }
+}
