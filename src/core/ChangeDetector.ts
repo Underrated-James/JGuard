@@ -67,11 +67,18 @@ export class ChangeDetector {
       }
     }
 
+    // L2: Initialize all decisions as pending
+    const decisions: Record<string, import('./types').FileDecision> = {};
+    for (const change of changes) {
+      decisions[change.relativePath] = 'pending';
+    }
+
     return {
       checkpointId: checkpoint.id,
       computedAt: Date.now(),
       changes,
       aiStateHashes,
+      decisions,
     };
   }
 }

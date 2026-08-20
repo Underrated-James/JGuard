@@ -22,23 +22,43 @@
       },
       {
         "command": "jguard.toggleChanges",
-        "title": "JGuard: Toggle AI Changes",
+        "title": "JGuard: Toggle AI Changes (All)",
         "icon": "$(versions)"
       },
       {
         "command": "jguard.acceptAll",
-        "title": "JGuard: Finalize (Keep Changes)",
-        "icon": "$(check)"
+        "title": "JGuard: Accept All Changes",
+        "icon": "$(check-all)"
       },
       {
         "command": "jguard.rejectAll",
-        "title": "JGuard: Discard (Revert & Close)",
+        "title": "JGuard: Reject All Changes",
         "icon": "$(discard)"
       },
       {
         "command": "jguard.refresh",
         "title": "JGuard: Refresh",
         "icon": "$(refresh)"
+      },
+      {
+        "command": "jguard.acceptFile",
+        "title": "JGuard: Accept File",
+        "icon": "$(check)"
+      },
+      {
+        "command": "jguard.rejectFile",
+        "title": "JGuard: Reject File",
+        "icon": "$(close)"
+      },
+      {
+        "command": "jguard.toggleFile",
+        "title": "JGuard: Toggle File",
+        "icon": "$(eye)"
+      },
+      {
+        "command": "jguard.finalize",
+        "title": "JGuard: Finalize Session",
+        "icon": "$(pass-filled)"
       }
     ],
     "views": {
@@ -65,8 +85,40 @@
           "command": "jguard.rejectAll",
           "when": "view == jguardSidebar",
           "group": "navigation@3"
+        },
+        {
+          "command": "jguard.finalize",
+          "when": "view == jguardSidebar",
+          "group": "navigation@4"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "jguard.acceptFile",
+          "when": "viewItem == jguard.changeItem",
+          "group": "inline@1"
+        },
+        {
+          "command": "jguard.rejectFile",
+          "when": "viewItem == jguard.changeItem",
+          "group": "inline@2"
+        },
+        {
+          "command": "jguard.toggleFile",
+          "when": "viewItem == jguard.changeItem || viewItem == jguard.changeItem.rejected",
+          "group": "inline@3"
         }
       ]
+    },
+    "configuration": {
+      "title": "JGuard",
+      "properties": {
+        "jguard.undoGracePeriodMinutes": {
+          "type": "number",
+          "default": 5,
+          "description": "Minutes after accepting changes during which you can undo the accept."
+        }
+      }
     }
   },
   "scripts": {

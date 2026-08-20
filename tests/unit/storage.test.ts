@@ -79,7 +79,8 @@ describe('Storage Engine', () => {
             mtime: 123,
             isBinary: false
           }
-        }
+        },
+        workspaceRoot: tmpDir,  // L1: required field
       };
 
       await store.write(cp.id, cp);

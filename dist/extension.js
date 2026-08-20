@@ -46,14 +46,21 @@ var MetadataStore = class {
   getCheckpointsDir() {
     return path.join(this.storageBaseDir, "checkpoints");
   }
+  getSessionsDir() {
+    return path.join(this.storageBaseDir, "sessions");
+  }
   getCheckpointPath(id) {
     return path.join(this.getCheckpointsDir(), `${id}.json`);
   }
+  getSessionPath(id) {
+    return path.join(this.getSessionsDir(), `${id}.json`);
+  }
   /**
-   * Initializes the checkpoints directory structure.
+   * Initializes the directory structure.
    */
   async initialize() {
     await fs.mkdir(this.getCheckpointsDir(), { recursive: true });
+    await fs.mkdir(this.getSessionsDir(), { recursive: true });
   }
   /**
    * Writes a checkpoint to disk atomically.
@@ -84,6 +91,36 @@ var MetadataStore = class {
     const cpPath = this.getCheckpointPath(id);
     try {
       await fs.unlink(cpPath);
+    } catch (err) {
+      if (err.code !== "ENOENT") {
+        throw err;
+      }
+    }
+  }
+  /**
+   * L1: Writes a checkpoint session to disk atomically.
+   */
+  async writeSession(id, session) {
+    const sessionPath = this.getSessionPath(id);
+    const tmpPath = `${sessionPath}.tmp.${Date.now()}`;
+    await fs.writeFile(tmpPath, JSON.stringify(session, null, 2), "utf-8");
+    await fs.rename(tmpPath, sessionPath);
+  }
+  /**
+   * L1: Reads a checkpoint session from disk.
+   */
+  async readSession(id) {
+    const sessionPath = this.getSessionPath(id);
+    const content = await fs.readFile(sessionPath, "utf-8");
+    return JSON.parse(content);
+  }
+  /**
+   * L1: Deletes a checkpoint session from disk.
+   */
+  async deleteSession(id) {
+    const sessionPath = this.getSessionPath(id);
+    try {
+      await fs.unlink(sessionPath);
     } catch (err) {
       if (err.code !== "ENOENT") {
         throw err;
@@ -210,6 +247,7 @@ var ObjectStore = class {
 
 // src/application/CheckpointService.ts
 var path3 = __toESM(require("path"));
+var fs4 = __toESM(require("fs/promises"));
 var CheckpointService = class {
   constructor(metadataStore, objectStore, scanner, workspaceRoot) {
     this.metadataStore = metadataStore;
@@ -235,58 +273,180 @@ var CheckpointService = class {
     return false;
   }
   /**
-   * Creates a new checkpoint of the current workspace state.
+   * L1: Creates a CheckpointSession spanning all workspace folders.
+   * Each folder gets its own Checkpoint, sharing the same ObjectStore.
+   * 
    * @param workspaceId The unique ID of the workspace.
-   * @returns The created checkpoint.
+   * @param workspaceFolders Array of workspace folder paths. If empty/undefined, falls back to this.workspaceRoot.
+   * @param onProgress Optional progress callback: (processedFiles, totalFiles) => void
+   * @returns The created CheckpointSession.
    */
-  async createCheckpoint(workspaceId) {
+  async createSession(workspaceId, workspaceFolders, onProgress) {
+    const sessionId = this.generateId();
+    const folderCheckpoints = {};
+    const folders = workspaceFolders && workspaceFolders.length > 0 ? workspaceFolders : [this.workspaceRoot];
+    for (const folderRoot of folders) {
+      const cp = await this.createCheckpointForFolder(workspaceId, folderRoot, onProgress);
+      folderCheckpoints[folderRoot] = cp;
+    }
+    const session = {
+      id: sessionId,
+      createdAt: Date.now(),
+      folderCheckpoints,
+      status: "active"
+    };
+    const lockFile = path3.join(this.metadataStore.storageBaseDir, "jguard.lock");
+    await fs4.writeFile(lockFile, sessionId, "utf-8");
+    this.cleanOldCheckpoints().catch(console.error);
+    return session;
+  }
+  /**
+   * L1: Creates a single checkpoint for one workspace folder.
+   * L4: Uses batched parallel processing for I/O throughput.
+   *
+   * @param workspaceId The workspace ID.
+   * @param folderRoot Absolute path to the workspace folder.
+   * @param onProgress Optional progress callback.
+   */
+  async createCheckpointForFolder(workspaceId, folderRoot, onProgress) {
     const id = this.generateId();
     const files = {};
     const paths = await this.scanner.scan();
-    for (const [relPath, meta] of paths.entries()) {
-      const absPath = path3.join(this.workspaceRoot, relPath);
-      const fs5 = require("fs/promises");
-      const content = await fs5.readFile(absPath);
-      const hash = await this.objectStore.write(content);
-      files[relPath] = {
-        hash,
-        size: meta.size,
-        mtime: meta.mtime,
-        isBinary: this.isBinary(content)
-      };
+    const entries = [...paths.entries()];
+    const totalFiles = entries.length;
+    const BATCH_SIZE = 50;
+    let processed = 0;
+    for (let i = 0; i < entries.length; i += BATCH_SIZE) {
+      const batch = entries.slice(i, i + BATCH_SIZE);
+      const results = await Promise.all(
+        batch.map(async ([relPath, meta]) => {
+          const absPath = path3.join(folderRoot, relPath);
+          const content = await fs4.readFile(absPath);
+          const hash = await this.objectStore.write(content);
+          return { relPath, hash, meta, isBinary: this.isBinary(content) };
+        })
+      );
+      for (const r of results) {
+        files[r.relPath] = {
+          hash: r.hash,
+          size: r.meta.size,
+          mtime: r.meta.mtime,
+          isBinary: r.isBinary
+        };
+      }
+      processed += batch.length;
+      if (onProgress) {
+        onProgress(processed, totalFiles);
+      }
     }
     const checkpoint = {
       id,
       workspaceId,
       createdAt: Date.now(),
       status: "active",
-      files
+      files,
+      workspaceRoot: folderRoot
+    };
+    await this.metadataStore.write(id, checkpoint);
+    return checkpoint;
+  }
+  /**
+   * Creates a new checkpoint of the current workspace state (legacy single-root API).
+   * Now delegates to createSession internally but returns a single Checkpoint for compatibility.
+   *
+   * @param workspaceId The unique ID of the workspace.
+   * @param onProgress Optional progress callback.
+   * @returns The created checkpoint.
+   */
+  async createCheckpoint(workspaceId, onProgress) {
+    const id = this.generateId();
+    const files = {};
+    const paths = await this.scanner.scan();
+    const entries = [...paths.entries()];
+    const totalFiles = entries.length;
+    const BATCH_SIZE = 50;
+    let processed = 0;
+    for (let i = 0; i < entries.length; i += BATCH_SIZE) {
+      const batch = entries.slice(i, i + BATCH_SIZE);
+      const results = await Promise.all(
+        batch.map(async ([relPath, meta]) => {
+          const absPath = path3.join(this.workspaceRoot, relPath);
+          const content = await fs4.readFile(absPath);
+          const hash = await this.objectStore.write(content);
+          return { relPath, hash, meta, isBinary: this.isBinary(content) };
+        })
+      );
+      for (const r of results) {
+        files[r.relPath] = {
+          hash: r.hash,
+          size: r.meta.size,
+          mtime: r.meta.mtime,
+          isBinary: r.isBinary
+        };
+      }
+      processed += batch.length;
+      if (onProgress) {
+        onProgress(processed, totalFiles);
+      }
+    }
+    const checkpoint = {
+      id,
+      workspaceId,
+      createdAt: Date.now(),
+      status: "active",
+      files,
+      workspaceRoot: this.workspaceRoot
     };
     await this.metadataStore.write(id, checkpoint);
     const lockFile = path3.join(this.metadataStore.storageBaseDir, "jguard.lock");
-    const fs22 = require("fs/promises");
-    await fs22.writeFile(lockFile, id, "utf-8");
+    await fs4.writeFile(lockFile, id, "utf-8");
     this.cleanOldCheckpoints().catch(console.error);
     return checkpoint;
   }
   /**
+   * L7: Updates an existing checkpoint in the metadata store.
+   */
+  async updateCheckpoint(checkpoint) {
+    await this.metadataStore.write(checkpoint.id, checkpoint);
+  }
+  /**
+   * L7: Updates an existing session in the metadata store.
+   */
+  async updateSession(session) {
+    await this.metadataStore.writeSession(session.id, session);
+  }
+  /**
+   * Reads a checkpoint by ID from the metadata store.
+   */
+  async readCheckpoint(id) {
+    return this.metadataStore.read(id);
+  }
+  /**
    * Cleans up old checkpoints, keeping only the most recent ones.
+   * L7: Respects grace period — doesn't GC recently finalized checkpoints.
    */
   async cleanOldCheckpoints(keepCount = 3) {
-    const fs5 = require("fs/promises");
+    const GRACE_PERIOD = 5 * 60 * 1e3;
+    const now = Date.now();
     const checkpointsDir = this.metadataStore.getCheckpointsDir();
     try {
-      const files = await fs5.readdir(checkpointsDir);
-      const cpFiles = files.filter((f) => f.endsWith(".json"));
+      const dirFiles = await fs4.readdir(checkpointsDir);
+      const cpFiles = dirFiles.filter((f) => f.endsWith(".json"));
       const checkpoints = [];
       for (const f of cpFiles) {
         const id = f.replace(".json", "");
         const cp = await this.metadataStore.read(id);
-        checkpoints.push({ id, createdAt: cp.createdAt });
+        checkpoints.push({ id, createdAt: cp.createdAt, finalizedAt: cp.finalizedAt });
       }
       checkpoints.sort((a, b) => b.createdAt - a.createdAt);
-      for (let i = keepCount; i < checkpoints.length; i++) {
-        await this.metadataStore.delete(checkpoints[i].id);
+      const deletable = checkpoints.filter((cp) => {
+        if (cp.finalizedAt && now - cp.finalizedAt < GRACE_PERIOD) {
+          return false;
+        }
+        return true;
+      });
+      for (let i = keepCount; i < deletable.length; i++) {
+        await this.metadataStore.delete(deletable[i].id);
       }
     } catch (e) {
     }
@@ -294,6 +454,7 @@ var CheckpointService = class {
 };
 
 // src/application/RestoreService.ts
+var fs5 = __toESM(require("fs/promises"));
 var RestoreService = class {
   constructor(objectStore) {
     this.objectStore = objectStore;
@@ -313,12 +474,22 @@ var RestoreService = class {
         if (verifiedHash !== op.objectHash) {
           throw new Error(`Hash mismatch during restore of ${op.relativePath}`);
         }
-        await require("vscode").workspace.fs.writeFile(require("vscode").Uri.file(op.absolutePath), content);
+        try {
+          const vscode6 = require("vscode");
+          await vscode6.workspace.fs.writeFile(vscode6.Uri.file(op.absolutePath), content);
+        } catch (e) {
+          await fs5.writeFile(op.absolutePath, content);
+        }
       } else if (op.type === "delete") {
         try {
-          await require("vscode").workspace.fs.delete(require("vscode").Uri.file(op.absolutePath), { useTrash: false });
+          try {
+            const vscode6 = require("vscode");
+            await vscode6.workspace.fs.delete(vscode6.Uri.file(op.absolutePath), { useTrash: false });
+          } catch (e) {
+            await fs5.unlink(op.absolutePath);
+          }
         } catch (err) {
-          if (err.code !== "ENOENT") {
+          if (err.code !== "ENOENT" && err.name !== "EntryNotFound (FileSystemError)") {
             throw err;
           }
         }
@@ -329,30 +500,72 @@ var RestoreService = class {
 
 // src/vscode/WorkspaceScanner.ts
 var vscode = __toESM(require("vscode"));
-var fs4 = __toESM(require("fs/promises"));
+var fs6 = __toESM(require("fs/promises"));
 var WorkspaceScanner = class {
   constructor(excludePatterns = ["**/node_modules/**", "**/.git/**", "**/dist/**"]) {
     this.excludePatterns = excludePatterns;
   }
-  async scan() {
+  /**
+   * Scans workspace files. 
+   * L1: When folderUri is provided, scans only that folder and returns folder-relative paths.
+   *     When omitted, scans all workspace folders — if multiple roots exist, prefixes paths
+   *     with the folder name to avoid collisions.
+   * L4: No hard file cap. Shows a non-blocking warning if > 100K files are found.
+   *
+   * @param folderUri Optional URI to scope scanning to a single workspace folder.
+   */
+  async scan(folderUri) {
     const map = /* @__PURE__ */ new Map();
     const excludeGlob = `{${this.excludePatterns.join(",")}}`;
-    const uris = await vscode.workspace.findFiles("**/*", excludeGlob);
-    if (uris.length > 5e4) {
-      throw new Error(`Workspace is too large for JGuard MVP (${uris.length} files). Please add more specific exclusions to .vscodeignore or .gitignore.`);
-    }
-    for (const uri of uris) {
-      if (uri.scheme === "file") {
-        const stat3 = await fs4.stat(uri.fsPath);
-        const relativePath = vscode.workspace.asRelativePath(uri, false);
-        map.set(relativePath, {
-          relativePath,
-          size: stat3.size,
-          mtime: stat3.mtimeMs
-        });
+    if (folderUri) {
+      const pattern = new vscode.RelativePattern(folderUri, "**/*");
+      const uris = await vscode.workspace.findFiles(pattern, excludeGlob);
+      this.warnIfLarge(uris.length);
+      for (const uri of uris) {
+        if (uri.scheme === "file") {
+          const stat3 = await fs6.stat(uri.fsPath);
+          const relativePath = vscode.workspace.asRelativePath(uri, false);
+          map.set(relativePath, {
+            relativePath,
+            size: stat3.size,
+            mtime: stat3.mtimeMs
+          });
+        }
       }
+    } else {
+      const folders = vscode.workspace.workspaceFolders;
+      if (!folders || folders.length === 0) {
+        return map;
+      }
+      const isMultiRoot = folders.length > 1;
+      for (const folder of folders) {
+        const pattern = new vscode.RelativePattern(folder.uri, "**/*");
+        const uris = await vscode.workspace.findFiles(pattern, excludeGlob);
+        for (const uri of uris) {
+          if (uri.scheme === "file") {
+            const stat3 = await fs6.stat(uri.fsPath);
+            const folderRelPath = vscode.workspace.asRelativePath(uri, isMultiRoot);
+            map.set(folderRelPath, {
+              relativePath: folderRelPath,
+              size: stat3.size,
+              mtime: stat3.mtimeMs
+            });
+          }
+        }
+      }
+      this.warnIfLarge(map.size);
     }
     return map;
+  }
+  /**
+   * L4: Non-blocking warning when file count is very high.
+   */
+  warnIfLarge(count) {
+    if (count > 1e5) {
+      vscode.window.showInformationMessage(
+        `JGuard: Scanning ${count.toLocaleString()} files. This may take a while. Consider adding exclusions to .gitignore or workspace settings.`
+      );
+    }
   }
 };
 
@@ -372,11 +585,13 @@ var StatusBar = class {
         this.item.text = "$(shield) AI Guard: OFF";
         this.item.tooltip = "Click to enable AI Guard checkpoint";
         this.item.backgroundColor = void 0;
+        this.item.command = "jguard.toggleProtection";
         break;
       case "protecting":
         this.item.text = "$(shield-check) AI Guard: PROTECTING";
         this.item.tooltip = "Workspace protected. Click to disable.";
         this.item.backgroundColor = void 0;
+        this.item.command = "jguard.toggleProtection";
         break;
       case "changes":
         this.item.text = `$(repo-sync) AI Guard: ${changeCount} CHANGES`;
@@ -388,6 +603,7 @@ var StatusBar = class {
         this.item.text = "$(alert) AI Guard: CONFLICT";
         this.item.tooltip = "Manual edits detected after AI changes. Review required.";
         this.item.backgroundColor = new vscode2.ThemeColor("statusBarItem.errorBackground");
+        this.item.command = "jguardSidebar.focus";
         break;
       case "restoring":
         this.item.text = "$(sync~spin) AI Guard: RESTORING...";
@@ -404,21 +620,48 @@ var StatusBar = class {
 
 // src/vscode/Sidebar.ts
 var vscode3 = __toESM(require("vscode"));
+var path4 = __toESM(require("path"));
 var GuardTreeItem = class extends vscode3.TreeItem {
-  constructor(label, collapsibleState, change) {
+  constructor(label, collapsibleState, change, decision, fileViewState, isBinary) {
     super(label, collapsibleState);
     this.label = label;
     this.collapsibleState = collapsibleState;
     this.change = change;
+    this.decision = decision;
+    this.fileViewState = fileViewState;
+    this.isBinary = isBinary;
     if (change) {
-      this.tooltip = change.relativePath;
-      this.description = change.type;
-      if (change.type === "modified") {
+      this.tooltip = this.buildTooltip(change);
+      if (decision === "accepted") {
+        this.description = `${change.type} \u2713 accepted`;
+      } else if (decision === "rejected") {
+        this.description = `${change.type} \u2717 rejected`;
+      } else {
+        if (fileViewState === "original") {
+          this.description = `${change.type} (showing original)`;
+        } else {
+          this.description = change.type;
+        }
+      }
+      if (decision === "accepted") {
+        this.iconPath = new vscode3.ThemeIcon("check", new vscode3.ThemeColor("charts.green"));
+      } else if (decision === "rejected") {
+        this.iconPath = new vscode3.ThemeIcon("close", new vscode3.ThemeColor("charts.red"));
+      } else if (isBinary) {
+        this.iconPath = new vscode3.ThemeIcon("file-binary");
+      } else if (change.type === "modified") {
         this.iconPath = new vscode3.ThemeIcon("edit");
       } else if (change.type === "created") {
         this.iconPath = new vscode3.ThemeIcon("add");
       } else if (change.type === "deleted") {
         this.iconPath = new vscode3.ThemeIcon("trash");
+      }
+      if (decision === "accepted") {
+        this.contextValue = "jguard.changeItem.accepted";
+      } else if (decision === "rejected") {
+        this.contextValue = "jguard.changeItem.rejected";
+      } else {
+        this.contextValue = "jguard.changeItem";
       }
       this.command = {
         command: "jguard.openDiff",
@@ -427,17 +670,36 @@ var GuardTreeItem = class extends vscode3.TreeItem {
       };
     }
   }
+  buildTooltip(change) {
+    const md = new vscode3.MarkdownString();
+    md.isTrusted = true;
+    md.appendMarkdown(`**${change.relativePath}**
+
+`);
+    md.appendMarkdown(`Type: \`${change.type}\`
+
+`);
+    md.appendMarkdown(`Click to view diff \u2022 Use inline buttons to Accept \u2713, Reject \u2717, or Toggle \u{1F441}`);
+    return md;
+  }
 };
 var SidebarProvider = class {
   _onDidChangeTreeData = new vscode3.EventEmitter();
   onDidChangeTreeData = this._onDidChangeTreeData.event;
-  currentChangeSet = null;
+  // L1: Multi-root changesets
+  changeSets = null;
   isProtecting = false;
   isHidden = false;
-  refresh(changeSet, isProtecting, isHidden = false) {
-    this.currentChangeSet = changeSet;
+  // L3: Per-file view states
+  fileViewStates = /* @__PURE__ */ new Map();
+  /**
+   * L1: Accepts either a Map of changesets (multi-root) or null.
+   */
+  refresh(changeSets, isProtecting, isHidden = false, fileViewStates) {
+    this.changeSets = changeSets;
     this.isProtecting = isProtecting;
     this.isHidden = isHidden;
+    this.fileViewStates = fileViewStates || /* @__PURE__ */ new Map();
     this._onDidChangeTreeData.fire();
   }
   getTreeItem(element) {
@@ -445,36 +707,70 @@ var SidebarProvider = class {
   }
   getChildren(element) {
     if (!this.isProtecting) {
-      return Promise.resolve([
-        new GuardTreeItem("Protection is OFF", vscode3.TreeItemCollapsibleState.None)
-      ]);
+      const item = new GuardTreeItem("Protection is OFF (Click to Enable)", vscode3.TreeItemCollapsibleState.None);
+      item.command = {
+        command: "jguard.toggleProtection",
+        title: "Enable Protection"
+      };
+      item.iconPath = new vscode3.ThemeIcon("shield");
+      item.tooltip = "Click to create a checkpoint and enable AI Guard protection";
+      return Promise.resolve([item]);
     }
     if (!element) {
       const children = [
         new GuardTreeItem("Status: PROTECTING", vscode3.TreeItemCollapsibleState.None)
       ];
-      if (this.currentChangeSet && this.currentChangeSet.changes.length > 0) {
-        const title = this.isHidden ? `Changes Hidden (Showing Original)` : `Changes (${this.currentChangeSet.changes.length})`;
-        children.push(
-          new GuardTreeItem(
-            title,
-            vscode3.TreeItemCollapsibleState.Expanded
-          )
-        );
-      } else {
+      if (!this.changeSets || this.changeSets.size === 0) {
         children.push(
           new GuardTreeItem("No changes detected yet", vscode3.TreeItemCollapsibleState.None)
         );
+        return Promise.resolve(children);
+      }
+      const isMultiRoot = this.changeSets.size > 1;
+      if (isMultiRoot) {
+        for (const [wsRoot2, cs] of this.changeSets.entries()) {
+          const folderName = path4.basename(wsRoot2);
+          const count = cs.changes.length;
+          if (count > 0) {
+            const title = this.isHidden ? `\u{1F4C1} ${folderName} \u2014 Hidden (${count})` : `\u{1F4C1} ${folderName} \u2014 Changes (${count})`;
+            const item = new GuardTreeItem(title, vscode3.TreeItemCollapsibleState.Expanded);
+            item._wsRoot = wsRoot2;
+            children.push(item);
+          }
+        }
+      } else {
+        const [, cs] = [...this.changeSets.entries()][0];
+        if (cs.changes.length > 0) {
+          const title = this.isHidden ? `Changes Hidden (Showing Original)` : `Changes (${cs.changes.length})`;
+          const item = new GuardTreeItem(title, vscode3.TreeItemCollapsibleState.Expanded);
+          item._wsRoot = [...this.changeSets.keys()][0];
+          children.push(item);
+        } else {
+          children.push(
+            new GuardTreeItem("No changes detected yet", vscode3.TreeItemCollapsibleState.None)
+          );
+        }
       }
       return Promise.resolve(children);
-    } else if (element.label.startsWith("Changes")) {
-      if (this.currentChangeSet) {
-        return Promise.resolve(
-          this.currentChangeSet.changes.map(
-            (c) => new GuardTreeItem(c.relativePath, vscode3.TreeItemCollapsibleState.None, c)
-          )
-        );
-      }
+    }
+    const wsRoot = element._wsRoot;
+    if (wsRoot && this.changeSets?.has(wsRoot)) {
+      const cs = this.changeSets.get(wsRoot);
+      return Promise.resolve(
+        cs.changes.map((c) => {
+          const decision = cs.decisions[c.relativePath] || "pending";
+          const viewState = this.fileViewStates.get(c.relativePath) || "ai";
+          const isBinary = false;
+          return new GuardTreeItem(
+            c.relativePath,
+            vscode3.TreeItemCollapsibleState.None,
+            c,
+            decision,
+            viewState,
+            isBinary
+          );
+        })
+      );
     }
     return Promise.resolve([]);
   }
@@ -503,10 +799,11 @@ var DiffProvider = class {
 
 // src/vscode/Commands.ts
 var vscode4 = __toESM(require("vscode"));
-var path7 = __toESM(require("path"));
+var path9 = __toESM(require("path"));
+var fs7 = __toESM(require("fs/promises"));
 
 // src/core/ChangeDetector.ts
-var path4 = __toESM(require("path"));
+var path5 = __toESM(require("path"));
 var ChangeDetector = class {
   /**
    * Compares the current workspace state against a checkpoint.
@@ -530,7 +827,7 @@ var ChangeDetector = class {
         if (current.mtime === snapshot.mtime && current.size === snapshot.size) {
           continue;
         }
-        const absPath = path4.join(workspaceRoot, relPath);
+        const absPath = path5.join(workspaceRoot, relPath);
         const currentHash = await Hasher.hashFile(absPath);
         if (currentHash !== snapshot.hash) {
           changes.push({
@@ -545,7 +842,7 @@ var ChangeDetector = class {
     }
     for (const [relPath, current] of currentPaths.entries()) {
       if (!checkpoint.files[relPath]) {
-        const absPath = path4.join(workspaceRoot, relPath);
+        const absPath = path5.join(workspaceRoot, relPath);
         const currentHash = await Hasher.hashFile(absPath);
         changes.push({
           type: "created",
@@ -555,17 +852,22 @@ var ChangeDetector = class {
         aiStateHashes[relPath] = currentHash;
       }
     }
+    const decisions = {};
+    for (const change of changes) {
+      decisions[change.relativePath] = "pending";
+    }
     return {
       checkpointId: checkpoint.id,
       computedAt: Date.now(),
       changes,
-      aiStateHashes
+      aiStateHashes,
+      decisions
     };
   }
 };
 
 // src/core/ConflictDetector.ts
-var path5 = __toESM(require("path"));
+var path6 = __toESM(require("path"));
 var ConflictDetector = class {
   /**
    * Detects if any files modified by the AI were subsequently modified by the user
@@ -584,7 +886,7 @@ var ConflictDetector = class {
         if (!currentMeta) {
           continue;
         }
-        const absPath = path5.join(workspaceRoot, change.relativePath);
+        const absPath = path6.join(workspaceRoot, change.relativePath);
         const currentHash = await Hasher.hashFile(absPath);
         const aiHash = changeSet.aiStateHashes[change.relativePath];
         if (currentHash !== aiHash && (change.type === "modified" ? currentHash !== change.checkpointHash : true)) {
@@ -602,7 +904,7 @@ var ConflictDetector = class {
 };
 
 // src/core/RestorePlanner.ts
-var path6 = __toESM(require("path"));
+var path7 = __toESM(require("path"));
 var RestorePlanner = class {
   /**
    * Generates a deterministic plan of restore operations to rollback the workspace.
@@ -619,7 +921,7 @@ var RestorePlanner = class {
       if (conflictPaths.has(change.relativePath)) {
         continue;
       }
-      const absPath = path6.join(workspaceRoot, change.relativePath);
+      const absPath = path7.join(workspaceRoot, change.relativePath);
       if (change.type === "modified") {
         plan.operations.push({
           type: "write",
@@ -653,19 +955,108 @@ var RestorePlanner = class {
   }
 };
 
+// src/core/SelectiveRestorePlanner.ts
+var path8 = __toESM(require("path"));
+var SelectiveRestorePlanner = class {
+  /**
+   * Generates a restore plan that only restores rejected files.
+   * Accepted and pending files are left untouched.
+   */
+  static buildPlan(checkpoint, changeSet, conflicts, workspaceRoot) {
+    const plan = { operations: [] };
+    const conflictPaths = new Set(conflicts.map((c) => c.relativePath));
+    const rejectedChanges = changeSet.changes.filter(
+      (c) => changeSet.decisions[c.relativePath] === "rejected"
+    );
+    for (const change of rejectedChanges) {
+      if (conflictPaths.has(change.relativePath)) {
+        continue;
+      }
+      const absPath = path8.join(workspaceRoot, change.relativePath);
+      if (change.type === "modified") {
+        plan.operations.push({
+          type: "write",
+          relativePath: change.relativePath,
+          absolutePath: absPath,
+          objectHash: change.checkpointHash
+        });
+      } else if (change.type === "created") {
+        plan.operations.push({
+          type: "delete",
+          relativePath: change.relativePath,
+          absolutePath: absPath,
+          objectHash: null
+        });
+      } else if (change.type === "deleted") {
+        plan.operations.push({
+          type: "write",
+          relativePath: change.relativePath,
+          absolutePath: absPath,
+          objectHash: change.checkpointHash
+        });
+      }
+    }
+    plan.operations.sort((a, b) => {
+      if (a.type !== b.type) {
+        return a.type === "delete" ? -1 : 1;
+      }
+      return a.relativePath.localeCompare(b.relativePath);
+    });
+    return plan;
+  }
+  /**
+   * L2/L3: Builds a single-file restore plan.
+   * Used for per-file reject and per-file toggle.
+   */
+  static buildSingleFilePlan(change, objectHash, workspaceRoot) {
+    const absPath = path8.join(workspaceRoot, change.relativePath);
+    const plan = { operations: [] };
+    if (change.type === "modified" || change.type === "deleted") {
+      plan.operations.push({
+        type: "write",
+        relativePath: change.relativePath,
+        absolutePath: absPath,
+        objectHash
+      });
+    } else if (change.type === "created") {
+      plan.operations.push({
+        type: "delete",
+        relativePath: change.relativePath,
+        absolutePath: absPath,
+        objectHash: null
+      });
+    }
+    return plan;
+  }
+};
+
 // src/vscode/Commands.ts
 var Commands = class {
-  constructor(context, checkpointService, restoreService, scanner, sidebar, statusBar2) {
+  constructor(context, checkpointService, restoreService, scanner, sidebar, statusBar2, objectStore) {
     this.context = context;
     this.checkpointService = checkpointService;
     this.restoreService = restoreService;
     this.scanner = scanner;
     this.sidebar = sidebar;
     this.statusBar = statusBar2;
+    this.objectStore = objectStore;
   }
-  activeCheckpoint = null;
-  currentChangeSet = null;
-  forwardCheckpoint = null;
+  // L1: Session-based state (multi-root)
+  activeSession = null;
+  forwardSession = null;
+  // Per-folder changesets (L1: one per workspace folder)
+  changeSets = /* @__PURE__ */ new Map();
+  // wsRoot → ChangeSet
+  // L2: AI snapshot hashes for rejected files (so they can be toggled back)
+  aiSnapshotHashes = /* @__PURE__ */ new Map();
+  // relPath → hash in ObjectStore
+  // L3: Per-file view state
+  fileViewStates = /* @__PURE__ */ new Map();
+  // relPath → 'ai' | 'original'
+  // L7: Last finalized session ID for undo
+  lastFinalizedSessionId = null;
+  lastFinalizedAt = 0;
+  // Bulk view state for backward-compat bulk toggle
   viewState = "ai";
   register() {
     this.context.subscriptions.push(
@@ -674,11 +1065,17 @@ var Commands = class {
       vscode4.commands.registerCommand("jguard.openDiff", this.openDiff.bind(this)),
       vscode4.commands.registerCommand("jguard.acceptAll", this.acceptAll.bind(this)),
       vscode4.commands.registerCommand("jguard.rejectAll", this.rejectAll.bind(this)),
-      vscode4.commands.registerCommand("jguard.refresh", this.refresh.bind(this))
+      vscode4.commands.registerCommand("jguard.refresh", this.refresh.bind(this)),
+      // L2: Per-file accept/reject
+      vscode4.commands.registerCommand("jguard.acceptFile", this.acceptFile.bind(this)),
+      vscode4.commands.registerCommand("jguard.rejectFile", this.rejectFile.bind(this)),
+      vscode4.commands.registerCommand("jguard.finalize", this.finalize.bind(this)),
+      // L3: Per-file toggle
+      vscode4.commands.registerCommand("jguard.toggleFile", this.toggleFile.bind(this))
     );
     const watcher = vscode4.workspace.createFileSystemWatcher("**/*");
     const onDidChange = async () => {
-      if (this.activeCheckpoint) {
+      if (this.activeSession) {
         await this.refresh();
       }
     };
@@ -689,8 +1086,14 @@ var Commands = class {
       watcher
     );
   }
+  /**
+   * Provides a way to restore session state (used for crash recovery).
+   */
+  restoreSessionState(session) {
+    this.activeSession = session;
+  }
   async toggleProtection() {
-    if (this.activeCheckpoint) {
+    if (this.activeSession) {
       const action = await vscode4.window.showInformationMessage(
         "AI Guard is currently active. Do you want to Accept all changes or Reject all changes?",
         "Accept All",
@@ -714,42 +1117,82 @@ var Commands = class {
       location: vscode4.ProgressLocation.Notification,
       title: "AI Guard: Creating Checkpoint...",
       cancellable: false
-    }, async () => {
+    }, async (progress) => {
       try {
-        const workspaceId = "ws-id";
-        this.activeCheckpoint = await this.checkpointService.createCheckpoint(workspaceId);
+        const folderPaths = workspaceFolders.map((f) => f.uri.fsPath);
+        this.activeSession = await this.checkpointService.createSession(
+          "ws-id",
+          folderPaths,
+          (processed, total) => {
+            const pct = Math.round(processed / total * 100);
+            progress.report({
+              message: `(${processed.toLocaleString()} / ${total.toLocaleString()} files)`,
+              increment: pct
+            });
+          }
+        );
         this.statusBar.setState("protecting");
         this.sidebar.refresh(null, true);
-        vscode4.window.showInformationMessage("AI Guard: Workspace checkpoint created. You are now protected.");
+        const folderCount = Object.keys(this.activeSession.folderCheckpoints).length;
+        const msg = folderCount > 1 ? `AI Guard: Checkpoint created across ${folderCount} workspace folders. You are now protected.` : "AI Guard: Workspace checkpoint created. You are now protected.";
+        vscode4.window.showInformationMessage(msg);
       } catch (err) {
         vscode4.window.showErrorMessage(`Failed to create checkpoint: ${err.message}`);
       }
     });
   }
   async refresh() {
-    if (!this.activeCheckpoint)
+    if (!this.activeSession)
       return;
-    const root = vscode4.workspace.workspaceFolders[0].uri.fsPath;
-    this.currentChangeSet = await ChangeDetector.detectChanges(this.activeCheckpoint, this.scanner, root);
-    const count = this.currentChangeSet.changes.length;
-    if (count > 0) {
-      this.statusBar.setState("changes", count);
+    this.changeSets.clear();
+    let totalCount = 0;
+    for (const [wsRoot, checkpoint] of Object.entries(this.activeSession.folderCheckpoints)) {
+      const changeSet = await ChangeDetector.detectChanges(checkpoint, this.scanner, wsRoot);
+      const existingCs = this.changeSets.get(wsRoot);
+      if (existingCs) {
+        for (const change of changeSet.changes) {
+          if (existingCs.decisions[change.relativePath]) {
+            changeSet.decisions[change.relativePath] = existingCs.decisions[change.relativePath];
+          }
+        }
+      }
+      this.changeSets.set(wsRoot, changeSet);
+      totalCount += changeSet.changes.length;
+    }
+    if (totalCount > 0) {
+      this.statusBar.setState("changes", totalCount);
     } else {
       this.statusBar.setState("protecting");
     }
-    this.sidebar.refresh(this.currentChangeSet, true);
+    this.sidebar.refresh(this.changeSets, true, false, this.fileViewStates);
   }
   async openDiff(change) {
-    if (!this.activeCheckpoint)
+    if (!this.activeSession)
       return;
-    const wsFolder = vscode4.workspace.workspaceFolders[0].uri.fsPath;
-    const currentUri = vscode4.Uri.file(path7.join(wsFolder, change.relativePath));
+    const wsFolder = this.findWorkspaceRootForFile(change.relativePath);
+    if (!wsFolder)
+      return;
+    const currentUri = vscode4.Uri.file(path9.join(wsFolder, change.relativePath));
     let originalUri;
     if (change.type === "created") {
       originalUri = vscode4.Uri.parse(`${DiffProvider.scheme}://empty/${change.relativePath}`);
     } else {
       const hash = change.type === "modified" ? change.checkpointHash : change.checkpointHash;
       originalUri = vscode4.Uri.parse(`${DiffProvider.scheme}://${hash}/${change.relativePath}`);
+    }
+    const checkpoint = this.activeSession.folderCheckpoints[wsFolder];
+    const snapshot = checkpoint?.files[change.relativePath];
+    if (snapshot?.isBinary) {
+      if (this.isImageFile(change.relativePath)) {
+        await this.openBinaryComparison(change, wsFolder);
+      } else {
+        vscode4.window.showInformationMessage(
+          `Binary file changed: ${change.relativePath}
+Original: ${snapshot.size} bytes (${snapshot.hash.slice(0, 8)}\u2026)
+Current state differs`
+        );
+      }
+      return;
     }
     const title = `${change.relativePath} (Checkpoint \u2194 Current)`;
     if (change.type === "deleted") {
@@ -759,11 +1202,10 @@ var Commands = class {
     }
   }
   async toggleChanges() {
-    if (!this.activeCheckpoint) {
+    if (!this.activeSession) {
       vscode4.window.showInformationMessage("AI Guard is not active.");
       return;
     }
-    const wsFolder = vscode4.workspace.workspaceFolders[0].uri.fsPath;
     await vscode4.commands.executeCommand("workbench.action.files.saveAll");
     vscode4.window.withProgress({
       location: vscode4.ProgressLocation.Notification,
@@ -772,26 +1214,34 @@ var Commands = class {
     }, async () => {
       try {
         if (this.viewState === "ai") {
-          this.forwardCheckpoint = await this.checkpointService.createCheckpoint("ws-id");
-          const fs5 = require("fs/promises");
-          const lockFile = path7.join(this.checkpointService.metadataStore.storageBaseDir, "jguard.lock");
-          await fs5.writeFile(lockFile, this.activeCheckpoint.id, "utf-8");
-          this.currentChangeSet = await ChangeDetector.detectChanges(this.activeCheckpoint, this.scanner, wsFolder);
-          const plan = RestorePlanner.buildPlan(this.activeCheckpoint, this.currentChangeSet, [], wsFolder);
-          this.statusBar.setState("restoring");
-          await this.restoreService.execute(plan);
+          this.forwardSession = await this.createForwardSession();
+          const lockFile = path9.join(this.checkpointService.metadataStore.storageBaseDir, "jguard.lock");
+          await fs7.writeFile(lockFile, this.activeSession.id, "utf-8");
+          for (const [wsRoot, checkpoint] of Object.entries(this.activeSession.folderCheckpoints)) {
+            const changeSet = await ChangeDetector.detectChanges(checkpoint, this.scanner, wsRoot);
+            const plan = RestorePlanner.buildPlan(checkpoint, changeSet, [], wsRoot);
+            await this.restoreService.execute(plan);
+          }
           this.viewState = "original";
-          this.statusBar.setState("changes", this.currentChangeSet.changes.length);
-          this.sidebar.refresh(this.currentChangeSet, true, true);
+          this.fileViewStates.clear();
+          for (const cs of this.changeSets.values()) {
+            for (const change of cs.changes) {
+              this.fileViewStates.set(change.relativePath, "original");
+            }
+          }
+          this.statusBar.setState("changes", this.getTotalChangeCount());
+          this.sidebar.refresh(this.changeSets, true, true, this.fileViewStates);
           vscode4.window.showInformationMessage("AI Guard: Changes hidden (showing Original).");
         } else {
-          if (!this.forwardCheckpoint)
+          if (!this.forwardSession)
             return;
-          const forwardChangeSet = await ChangeDetector.detectChanges(this.forwardCheckpoint, this.scanner, wsFolder);
-          const plan = RestorePlanner.buildPlan(this.forwardCheckpoint, forwardChangeSet, [], wsFolder);
-          this.statusBar.setState("restoring");
-          await this.restoreService.execute(plan);
+          for (const [wsRoot, checkpoint] of Object.entries(this.forwardSession.folderCheckpoints)) {
+            const forwardChangeSet = await ChangeDetector.detectChanges(checkpoint, this.scanner, wsRoot);
+            const plan = RestorePlanner.buildPlan(checkpoint, forwardChangeSet, [], wsRoot);
+            await this.restoreService.execute(plan);
+          }
           this.viewState = "ai";
+          this.fileViewStates.clear();
           await this.refresh();
           vscode4.window.showInformationMessage("AI Guard: Changes applied (showing AI).");
         }
@@ -800,81 +1250,338 @@ var Commands = class {
       }
     });
   }
+  // ─── L2: Per-File Accept ─────────────────────────────────────────────
+  async acceptFile(change) {
+    if (!this.activeSession)
+      return;
+    const wsRoot = this.findWorkspaceRootForFile(change.relativePath);
+    if (!wsRoot)
+      return;
+    const cs = this.changeSets.get(wsRoot);
+    if (!cs)
+      return;
+    cs.decisions[change.relativePath] = "accepted";
+    this.sidebar.refresh(this.changeSets, true, false, this.fileViewStates);
+    vscode4.window.showInformationMessage(`\u2713 Accepted: ${change.relativePath}`);
+  }
+  // ─── L2: Per-File Reject (Immediate + Auto-Snapshot) ─────────────────
+  async rejectFile(change) {
+    if (!this.activeSession)
+      return;
+    const wsRoot = this.findWorkspaceRootForFile(change.relativePath);
+    if (!wsRoot)
+      return;
+    const cs = this.changeSets.get(wsRoot);
+    const checkpoint = this.activeSession.folderCheckpoints[wsRoot];
+    if (!cs || !checkpoint)
+      return;
+    await vscode4.commands.executeCommand("workbench.action.files.saveAll");
+    try {
+      const absPath = path9.join(wsRoot, change.relativePath);
+      if (change.type !== "deleted") {
+        const aiContent = await fs7.readFile(absPath);
+        const aiHash = await this.objectStore.write(aiContent);
+        this.aiSnapshotHashes.set(change.relativePath, aiHash);
+      }
+      if (change.type === "modified" || change.type === "deleted") {
+        const plan = SelectiveRestorePlanner.buildSingleFilePlan(change, change.checkpointHash, wsRoot);
+        await this.restoreService.execute(plan);
+      } else if (change.type === "created") {
+        const plan = SelectiveRestorePlanner.buildSingleFilePlan(change, null, wsRoot);
+        await this.restoreService.execute(plan);
+      }
+      cs.decisions[change.relativePath] = "rejected";
+      this.fileViewStates.set(change.relativePath, "original");
+      this.sidebar.refresh(this.changeSets, true, false, this.fileViewStates);
+      vscode4.window.showInformationMessage(`\u2717 Rejected: ${change.relativePath} (AI version saved \u2014 toggle back anytime)`);
+    } catch (err) {
+      vscode4.window.showErrorMessage(`Failed to reject ${change.relativePath}: ${err.message}`);
+    }
+  }
+  // ─── L3: Per-File Toggle ─────────────────────────────────────────────
+  async toggleFile(change) {
+    if (!this.activeSession)
+      return;
+    const wsRoot = this.findWorkspaceRootForFile(change.relativePath);
+    if (!wsRoot)
+      return;
+    const checkpoint = this.activeSession.folderCheckpoints[wsRoot];
+    if (!checkpoint)
+      return;
+    await vscode4.commands.executeCommand("workbench.action.files.saveAll");
+    const currentState = this.fileViewStates.get(change.relativePath) || "ai";
+    try {
+      if (currentState === "ai") {
+        const absPath = path9.join(wsRoot, change.relativePath);
+        if (change.type !== "deleted") {
+          const aiContent = await fs7.readFile(absPath);
+          const aiHash = await this.objectStore.write(aiContent);
+          this.aiSnapshotHashes.set(change.relativePath, aiHash);
+        }
+        if (change.type === "modified" || change.type === "deleted") {
+          const plan = SelectiveRestorePlanner.buildSingleFilePlan(change, change.checkpointHash, wsRoot);
+          await this.restoreService.execute(plan);
+        } else if (change.type === "created") {
+          const plan = SelectiveRestorePlanner.buildSingleFilePlan(change, null, wsRoot);
+          await this.restoreService.execute(plan);
+        }
+        this.fileViewStates.set(change.relativePath, "original");
+      } else {
+        const aiHash = this.aiSnapshotHashes.get(change.relativePath);
+        if (!aiHash && change.type !== "deleted") {
+          vscode4.window.showWarningMessage(`No AI snapshot found for ${change.relativePath}.`);
+          return;
+        }
+        if (change.type === "created" || change.type === "modified") {
+          const plan = SelectiveRestorePlanner.buildSingleFilePlan(change, aiHash, wsRoot);
+          await this.restoreService.execute(plan);
+        } else if (change.type === "deleted") {
+          const plan = SelectiveRestorePlanner.buildSingleFilePlan(change, null, wsRoot);
+          await this.restoreService.execute(plan);
+        }
+        this.fileViewStates.set(change.relativePath, "ai");
+      }
+      this.sidebar.refresh(this.changeSets, true, false, this.fileViewStates);
+    } catch (err) {
+      vscode4.window.showErrorMessage(`Toggle failed for ${change.relativePath}: ${err.message}`);
+    }
+  }
+  // ─── L2: Finalize Session ────────────────────────────────────────────
+  async finalize() {
+    if (!this.activeSession)
+      return;
+    const pendingCount = this.countPendingDecisions();
+    if (pendingCount > 0) {
+      const action = await vscode4.window.showInformationMessage(
+        `${pendingCount} file(s) have no decision yet. What should happen to them?`,
+        "Accept Remaining",
+        "Reject Remaining",
+        "Cancel"
+      );
+      if (action === "Accept Remaining") {
+        this.markAllPending("accepted");
+      } else if (action === "Reject Remaining") {
+        this.markAllPending("rejected");
+        await this.executeSelectiveRestore();
+      } else {
+        return;
+      }
+    }
+    await this.cleanupSession();
+    vscode4.window.showInformationMessage("AI Guard: Session finalized.");
+  }
+  // ─── Accept / Reject All ─────────────────────────────────────────────
   async acceptAll() {
-    if (!this.activeCheckpoint)
+    if (!this.activeSession)
       return;
     if (this.viewState === "original") {
-      const choice = await vscode4.window.showWarningMessage("You are currently viewing the Original state. Finalizing now will permanently discard the hidden AI changes. Continue?", "Discard AI Changes", "Cancel");
+      const choice = await vscode4.window.showWarningMessage(
+        "You are currently viewing the Original state. Finalizing now will permanently discard the hidden AI changes. Continue?",
+        "Discard AI Changes",
+        "Cancel"
+      );
       if (choice !== "Discard AI Changes")
         return;
     }
-    this.activeCheckpoint = null;
-    this.currentChangeSet = null;
-    this.forwardCheckpoint = null;
-    this.viewState = "ai";
-    this.statusBar.setState("off");
-    this.sidebar.refresh(null, false);
-    await this.clearLockFile();
-    vscode4.window.showInformationMessage("AI Guard: Protection finalized. Changes kept.");
+    this.markAllPending("accepted");
+    const session = this.activeSession;
+    this.lastFinalizedSessionId = session.id;
+    this.lastFinalizedAt = Date.now();
+    session.status = "accepted";
+    for (const cp of Object.values(session.folderCheckpoints)) {
+      cp.status = "accepted";
+      cp.finalizedAt = this.lastFinalizedAt;
+      await this.checkpointService.updateCheckpoint(cp);
+    }
+    await this.checkpointService.updateSession(session);
+    await this.cleanupSession();
+    const gracePeriodMin = vscode4.workspace.getConfiguration("jguard").get("undoGracePeriodMinutes", 5);
+    vscode4.window.showInformationMessage(
+      `AI Guard: Changes accepted. You can undo within ${gracePeriodMin} minutes.`,
+      "Undo Accept"
+    ).then(async (choice) => {
+      if (choice === "Undo Accept" && this.lastFinalizedSessionId) {
+        const elapsed = Date.now() - this.lastFinalizedAt;
+        if (elapsed < gracePeriodMin * 60 * 1e3) {
+          await this.undoAccept();
+        } else {
+          vscode4.window.showWarningMessage("Grace period expired. Cannot undo.");
+        }
+      }
+    });
   }
   async rejectAll() {
-    if (!this.activeCheckpoint)
+    if (!this.activeSession)
       return;
-    const wsFolder = vscode4.workspace.workspaceFolders[0].uri.fsPath;
     if (this.viewState === "original") {
-      this.activeCheckpoint = null;
-      this.currentChangeSet = null;
-      this.forwardCheckpoint = null;
-      this.viewState = "ai";
-      this.statusBar.setState("off");
-      this.sidebar.refresh(null, false);
-      await this.clearLockFile();
+      await this.cleanupSession();
       vscode4.window.showInformationMessage("AI Guard: Protection discarded. Original state kept.");
       return;
     }
     await vscode4.commands.executeCommand("workbench.action.files.saveAll");
-    this.currentChangeSet = await ChangeDetector.detectChanges(this.activeCheckpoint, this.scanner, wsFolder);
-    const conflicts = await ConflictDetector.detect(this.currentChangeSet, this.scanner, wsFolder);
-    if (conflicts.length > 0) {
-      this.statusBar.setState("conflict");
-      const msg = `AI Guard: ${conflicts.length} conflict(s) detected. Some files were modified by you AFTER the AI edited them. They will NOT be restored to prevent data loss.`;
-      vscode4.window.showWarningMessage(msg, "Proceed Anyway", "Cancel").then(async (choice) => {
-        if (choice === "Proceed Anyway") {
-          await this.executeRestore(this.activeCheckpoint, this.currentChangeSet, conflicts, wsFolder);
-        }
-      });
-      return;
+    for (const [wsRoot, checkpoint] of Object.entries(this.activeSession.folderCheckpoints)) {
+      const changeSet = await ChangeDetector.detectChanges(checkpoint, this.scanner, wsRoot);
+      const conflicts = await ConflictDetector.detect(changeSet, this.scanner, wsRoot);
+      if (conflicts.length > 0) {
+        this.statusBar.setState("conflict");
+        const msg = `AI Guard: ${conflicts.length} conflict(s) detected in ${path9.basename(wsRoot)}. Conflicted files will be skipped.`;
+        const choice = await vscode4.window.showWarningMessage(msg, "Proceed Anyway", "Cancel");
+        if (choice !== "Proceed Anyway")
+          return;
+        await this.executeRestore(checkpoint, changeSet, conflicts, wsRoot);
+      } else {
+        await this.executeRestore(checkpoint, changeSet, [], wsRoot);
+      }
     }
-    await this.executeRestore(this.activeCheckpoint, this.currentChangeSet, [], wsFolder);
+    await this.cleanupSession();
+    vscode4.window.showInformationMessage("AI Guard: Checkpoint discarded and safely reverted.");
   }
+  // ─── L7: Undo Accept ────────────────────────────────────────────────
+  async undoAccept() {
+    if (!this.lastFinalizedSessionId)
+      return;
+    try {
+      const session = await this.checkpointService.metadataStore.readSession(this.lastFinalizedSessionId);
+      session.status = "active";
+      for (const cp of Object.values(session.folderCheckpoints)) {
+        cp.status = "active";
+        cp.finalizedAt = void 0;
+      }
+      this.activeSession = session;
+      this.lastFinalizedSessionId = null;
+      this.lastFinalizedAt = 0;
+      const lockFile = path9.join(this.checkpointService.metadataStore.storageBaseDir, "jguard.lock");
+      await fs7.writeFile(lockFile, session.id, "utf-8");
+      this.statusBar.setState("protecting");
+      await this.refresh();
+      vscode4.window.showInformationMessage("AI Guard: Accept undone. Protection resumed.");
+    } catch (err) {
+      vscode4.window.showErrorMessage(`Failed to undo accept: ${err.message}`);
+    }
+  }
+  // ─── Internal Helpers ────────────────────────────────────────────────
   async executeRestore(cp, cs, conflicts, wsFolder) {
     this.statusBar.setState("restoring");
-    try {
-      const plan = RestorePlanner.buildPlan(cp, cs, conflicts, wsFolder);
-      await this.restoreService.execute(plan);
-      this.activeCheckpoint = null;
-      this.currentChangeSet = null;
-      this.forwardCheckpoint = null;
-      this.viewState = "ai";
-      this.statusBar.setState("off");
-      this.sidebar.refresh(null, false);
-      await this.clearLockFile();
-      vscode4.window.showInformationMessage("AI Guard: Checkpoint discarded and safely reverted.");
-    } catch (err) {
-      vscode4.window.showErrorMessage(`Restore failed: ${err.message}`);
-      this.statusBar.setState("changes", cs.changes.length);
+    const plan = RestorePlanner.buildPlan(cp, cs, conflicts, wsFolder);
+    await this.restoreService.execute(plan);
+  }
+  async executeSelectiveRestore() {
+    if (!this.activeSession)
+      return;
+    for (const [wsRoot, cs] of this.changeSets.entries()) {
+      const checkpoint = this.activeSession.folderCheckpoints[wsRoot];
+      if (!checkpoint)
+        continue;
+      const plan = SelectiveRestorePlanner.buildPlan(checkpoint, cs, [], wsRoot);
+      if (plan.operations.length > 0) {
+        this.statusBar.setState("restoring");
+        await this.restoreService.execute(plan);
+      }
     }
   }
+  async cleanupSession() {
+    this.activeSession = null;
+    this.forwardSession = null;
+    this.changeSets.clear();
+    this.fileViewStates.clear();
+    this.aiSnapshotHashes.clear();
+    this.viewState = "ai";
+    this.statusBar.setState("off");
+    this.sidebar.refresh(null, false);
+    await this.clearLockFile();
+  }
   async clearLockFile() {
-    const fs5 = require("fs/promises");
-    const lockFile = path7.join(this.checkpointService.metadataStore.storageBaseDir, "jguard.lock");
-    await fs5.unlink(lockFile).catch(() => {
+    const lockFile = path9.join(this.checkpointService.metadataStore.storageBaseDir, "jguard.lock");
+    await fs7.unlink(lockFile).catch(() => {
     });
+  }
+  async createForwardSession() {
+    const folders = vscode4.workspace.workspaceFolders;
+    if (!folders)
+      throw new Error("No workspace folders");
+    const folderCheckpoints = {};
+    for (const folder of folders) {
+      const wsRoot = folder.uri.fsPath;
+      const cp = await this.checkpointService.createCheckpoint(wsRoot);
+      folderCheckpoints[wsRoot] = cp;
+    }
+    return {
+      id: Date.now().toString(36) + Math.random().toString(36).substring(2),
+      createdAt: Date.now(),
+      folderCheckpoints,
+      status: "active"
+    };
+  }
+  /**
+   * L1: Finds which workspace root owns a given relative path.
+   */
+  findWorkspaceRootForFile(relativePath) {
+    for (const [wsRoot, cs] of this.changeSets.entries()) {
+      if (cs.changes.some((c) => c.relativePath === relativePath)) {
+        return wsRoot;
+      }
+    }
+    const folders = vscode4.workspace.workspaceFolders;
+    return folders && folders.length > 0 ? folders[0].uri.fsPath : null;
+  }
+  getTotalChangeCount() {
+    let total = 0;
+    for (const cs of this.changeSets.values()) {
+      total += cs.changes.length;
+    }
+    return total;
+  }
+  countPendingDecisions() {
+    let count = 0;
+    for (const cs of this.changeSets.values()) {
+      for (const decision of Object.values(cs.decisions)) {
+        if (decision === "pending")
+          count++;
+      }
+    }
+    return count;
+  }
+  markAllPending(decision) {
+    for (const cs of this.changeSets.values()) {
+      for (const relPath of Object.keys(cs.decisions)) {
+        if (cs.decisions[relPath] === "pending") {
+          cs.decisions[relPath] = decision;
+        }
+      }
+    }
+  }
+  // L6: Image file detection
+  isImageFile(filePath) {
+    const ext = path9.extname(filePath).toLowerCase();
+    return [".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".ico", ".bmp"].includes(ext);
+  }
+  // L6: Open binary image comparison
+  async openBinaryComparison(change, wsRoot) {
+    try {
+      const checkpoint = this.activeSession?.folderCheckpoints[wsRoot];
+      if (!checkpoint)
+        return;
+      const snapshot = checkpoint.files[change.relativePath];
+      if (!snapshot)
+        return;
+      const content = await this.objectStore.read(snapshot.hash);
+      const tmpDir = path9.join(this.checkpointService.metadataStore.storageBaseDir, "tmp");
+      await fs7.mkdir(tmpDir, { recursive: true });
+      const tmpFile = path9.join(tmpDir, `checkpoint-${path9.basename(change.relativePath)}`);
+      await fs7.writeFile(tmpFile, content);
+      const originalUri = vscode4.Uri.file(tmpFile);
+      const currentUri = vscode4.Uri.file(path9.join(wsRoot, change.relativePath));
+      await vscode4.commands.executeCommand("vscode.open", originalUri, { viewColumn: vscode4.ViewColumn.One });
+      await vscode4.commands.executeCommand("vscode.open", currentUri, { viewColumn: vscode4.ViewColumn.Two });
+    } catch (err) {
+      vscode4.window.showErrorMessage(`Failed to compare binary file: ${err.message}`);
+    }
   }
 };
 
 // src/extension.ts
-var path8 = __toESM(require("path"));
+var path10 = __toESM(require("path"));
+var fs8 = __toESM(require("fs/promises"));
 var statusBar;
 var commands2;
 async function activate(context) {
@@ -896,12 +1603,11 @@ async function activate(context) {
   const diffProvider = new DiffProvider(objectStore);
   vscode5.window.registerTreeDataProvider("jguardSidebar", sidebar);
   vscode5.workspace.registerTextDocumentContentProvider(DiffProvider.scheme, diffProvider);
-  commands2 = new Commands(context, checkpointService, restoreService, scanner, sidebar, statusBar);
+  commands2 = new Commands(context, checkpointService, restoreService, scanner, sidebar, statusBar, objectStore);
   commands2.register();
-  const fs5 = require("fs/promises");
-  const lockFile = path8.join(storageBaseDir, "jguard.lock");
+  const lockFile = path10.join(storageBaseDir, "jguard.lock");
   try {
-    const activeId = await fs5.readFile(lockFile, "utf-8");
+    const activeId = await fs8.readFile(lockFile, "utf-8");
     if (activeId) {
       vscode5.window.showWarningMessage(
         "AI Guard: Found an active checkpoint from a previous session. Do you want to resume protecting?",
@@ -910,17 +1616,29 @@ async function activate(context) {
       ).then(async (choice) => {
         if (choice === "Resume") {
           try {
-            const cp = await metadataStore.read(activeId.trim());
-            commands2.activeCheckpoint = cp;
+            let session;
+            try {
+              session = await metadataStore.readSession(activeId.trim());
+            } catch {
+              const cp = await metadataStore.read(activeId.trim());
+              const wsRoot2 = cp.workspaceRoot || (vscode5.workspace.workspaceFolders?.[0]?.uri.fsPath || "");
+              session = {
+                id: activeId.trim(),
+                createdAt: cp.createdAt,
+                folderCheckpoints: { [wsRoot2]: cp },
+                status: "active"
+              };
+            }
+            commands2.restoreSessionState(session);
             statusBar.setState("protecting");
             await commands2.refresh();
           } catch (e) {
             vscode5.window.showErrorMessage("Failed to resume checkpoint. It may be corrupted.");
-            await fs5.unlink(lockFile).catch(() => {
+            await fs8.unlink(lockFile).catch(() => {
             });
           }
         } else if (choice === "Discard") {
-          await fs5.unlink(lockFile).catch(() => {
+          await fs8.unlink(lockFile).catch(() => {
           });
         }
       });

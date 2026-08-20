@@ -1,6 +1,6 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
-import { Checkpoint } from '../core/types';
+import { Checkpoint, CheckpointSession } from '../core/types';
 
 export class MetadataStore {
   constructor(private storageBaseDir: string) {}
@@ -9,15 +9,24 @@ export class MetadataStore {
     return path.join(this.storageBaseDir, 'checkpoints');
   }
 
+  private getSessionsDir(): string {
+    return path.join(this.storageBaseDir, 'sessions');
+  }
+
   private getCheckpointPath(id: string): string {
     return path.join(this.getCheckpointsDir(), `${id}.json`);
   }
 
+  private getSessionPath(id: string): string {
+    return path.join(this.getSessionsDir(), `${id}.json`);
+  }
+
   /**
-   * Initializes the checkpoints directory structure.
+   * Initializes the directory structure.
    */
   async initialize(): Promise<void> {
     await fs.mkdir(this.getCheckpointsDir(), { recursive: true });
+    await fs.mkdir(this.getSessionsDir(), { recursive: true });
   }
 
   /**
@@ -52,6 +61,39 @@ export class MetadataStore {
     const cpPath = this.getCheckpointPath(id);
     try {
       await fs.unlink(cpPath);
+    } catch (err: any) {
+      if (err.code !== 'ENOENT') {
+        throw err;
+      }
+    }
+  }
+
+  /**
+   * L1: Writes a checkpoint session to disk atomically.
+   */
+  async writeSession(id: string, session: CheckpointSession): Promise<void> {
+    const sessionPath = this.getSessionPath(id);
+    const tmpPath = `${sessionPath}.tmp.${Date.now()}`;
+    await fs.writeFile(tmpPath, JSON.stringify(session, null, 2), 'utf-8');
+    await fs.rename(tmpPath, sessionPath);
+  }
+
+  /**
+   * L1: Reads a checkpoint session from disk.
+   */
+  async readSession(id: string): Promise<CheckpointSession> {
+    const sessionPath = this.getSessionPath(id);
+    const content = await fs.readFile(sessionPath, 'utf-8');
+    return JSON.parse(content) as CheckpointSession;
+  }
+
+  /**
+   * L1: Deletes a checkpoint session from disk.
+   */
+  async deleteSession(id: string): Promise<void> {
+    const sessionPath = this.getSessionPath(id);
+    try {
+      await fs.unlink(sessionPath);
     } catch (err: any) {
       if (err.code !== 'ENOENT') {
         throw err;

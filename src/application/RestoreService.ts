@@ -27,12 +27,24 @@ export class RestoreService {
 
         // Use vscode.workspace.fs.writeFile for smooth editor updates and to avoid breaking file watchers
         // instead of atomic rename.
-        await require('vscode').workspace.fs.writeFile(require('vscode').Uri.file(op.absolutePath), content);
+        try {
+          const vscode = require('vscode');
+          await vscode.workspace.fs.writeFile(vscode.Uri.file(op.absolutePath), content);
+        } catch (e) {
+          // Fallback for unit tests outside VSCode environment
+          await fs.writeFile(op.absolutePath, content);
+        }
       } else if (op.type === 'delete') {
         try {
-          await require('vscode').workspace.fs.delete(require('vscode').Uri.file(op.absolutePath), { useTrash: false });
+          try {
+            const vscode = require('vscode');
+            await vscode.workspace.fs.delete(vscode.Uri.file(op.absolutePath), { useTrash: false });
+          } catch (e) {
+             // Fallback for unit tests outside VSCode environment
+             await fs.unlink(op.absolutePath);
+          }
         } catch (err: any) {
-          if (err.code !== 'ENOENT') {
+          if (err.code !== 'ENOENT' && err.name !== 'EntryNotFound (FileSystemError)') {
             throw err;
           }
         }

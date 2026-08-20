@@ -9,6 +9,7 @@ import { SidebarProvider } from './vscode/Sidebar';
 import { DiffProvider } from './vscode/DiffProvider';
 import { Commands } from './vscode/Commands';
 import * as path from 'path';
+import * as fs from 'fs/promises';
 
 let statusBar: StatusBar;
 let commands: Commands;
@@ -24,12 +25,12 @@ export async function activate(context: vscode.ExtensionContext) {
   await metadataStore.initialize();
   await objectStore.initialize();
 
-  // Core dependencies
   let wsRoot = '';
   if (vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0) {
     wsRoot = vscode.workspace.workspaceFolders[0].uri.fsPath;
   }
   
+  // L1: CheckpointService handles multi-root, but still takes a fallback wsRoot
   const scanner = new WorkspaceScanner();
   const checkpointService = new CheckpointService(metadataStore, objectStore, scanner, wsRoot);
   const restoreService = new RestoreService(objectStore);
@@ -43,12 +44,11 @@ export async function activate(context: vscode.ExtensionContext) {
   vscode.window.registerTreeDataProvider('jguardSidebar', sidebar);
   vscode.workspace.registerTextDocumentContentProvider(DiffProvider.scheme, diffProvider);
 
-  // Register commands
-  commands = new Commands(context, checkpointService, restoreService, scanner, sidebar, statusBar);
+  // Register commands — L2/L6: now receives objectStore for per-file snapshots and binary diffs
+  commands = new Commands(context, checkpointService, restoreService, scanner, sidebar, statusBar, objectStore);
   commands.register();
 
-  // Crash Recovery
-  const fs = require('fs/promises');
+  // Crash Recovery — L1: lockfile now stores session IDs
   const lockFile = path.join(storageBaseDir, 'jguard.lock');
   try {
     const activeId = await fs.readFile(lockFile, 'utf-8');
@@ -59,9 +59,23 @@ export async function activate(context: vscode.ExtensionContext) {
       ).then(async (choice) => {
         if (choice === 'Resume') {
           try {
-            const cp = await metadataStore.read(activeId.trim());
-            // We use a backdoor to restore state in MVP
-            (commands as any).activeCheckpoint = cp;
+            // Try to read as a session first (V2), fallback to checkpoint (V1 compat)
+            let session;
+            try {
+              session = await metadataStore.readSession(activeId.trim());
+            } catch {
+              // V1 fallback: read as a checkpoint and wrap in a session
+              const cp = await metadataStore.read(activeId.trim());
+              const wsRoot = cp.workspaceRoot || (vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '');
+              session = {
+                id: activeId.trim(),
+                createdAt: cp.createdAt,
+                folderCheckpoints: { [wsRoot]: cp },
+                status: 'active' as const,
+              };
+            }
+
+            commands.restoreSessionState(session);
             statusBar.setState('protecting');
             await (commands as any).refresh();
           } catch (e) {
@@ -81,4 +95,3 @@ export async function activate(context: vscode.ExtensionContext) {
 export function deactivate() {
   if (statusBar) statusBar.dispose();
 }
-
