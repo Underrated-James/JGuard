@@ -300,28 +300,28 @@ export class CheckpointService {
    * Manually clears old finalized sessions from history, keeping only the 3 most recent ones.
    */
   async clearOldHistory(keepCount: number = 3): Promise<void> {
-    const checkpointsDir = (this.metadataStore as any).getCheckpointsDir();
     try {
-      const dirFiles = await fs.readdir(checkpointsDir);
-      const cpFiles = dirFiles.filter((f: string) => f.endsWith('.json'));
+      const sessionIds = await this.metadataStore.listSessions();
       
-      const checkpoints: {id: string, createdAt: number, status: string}[] = [];
-      for (const f of cpFiles) {
-        const id = f.replace('.json', '');
-        const cp = await this.metadataStore.read(id);
-        checkpoints.push({ id, createdAt: cp.createdAt, status: cp.status });
+      const sessions: CheckpointSession[] = [];
+      for (const id of sessionIds) {
+        try {
+          const session = await this.metadataStore.readSession(id);
+          sessions.push(session);
+        } catch (e) {
+          console.error(`Failed to read session ${id}`, e);
+        }
       }
 
       // Sort descending (newest first)
-      checkpoints.sort((a, b) => b.createdAt - a.createdAt);
+      sessions.sort((a, b) => b.createdAt - a.createdAt);
 
-      const finalized = checkpoints.filter(cp => cp.status !== 'active');
+      const finalized = sessions.filter(session => session.status !== 'active');
       
       let deletedCount = 0;
       // Delete anything beyond keepCount
       for (let i = keepCount; i < finalized.length; i++) {
-        await this.metadataStore.delete(finalized[i].id);
-        await this.metadataStore.deleteSession(finalized[i].id);
+        await this.deleteHistorySessionInternal(finalized[i].id);
         deletedCount++;
       }
       
@@ -339,14 +339,27 @@ export class CheckpointService {
   }
 
   /**
+   * Internal helper that deletes a session without running GC, so we can bulk delete efficiently.
+   */
+  private async deleteHistorySessionInternal(sessionId: string): Promise<void> {
+    const cp = await this.metadataStore.readSession(sessionId);
+
+    // Delete associated folder checkpoints
+    if (cp.folderCheckpoints) {
+      for (const checkpoint of Object.values(cp.folderCheckpoints)) {
+        await this.metadataStore.delete(checkpoint.id);
+      }
+    }
+
+    await this.metadataStore.deleteSession(sessionId);
+  }
+
+  /**
    * Deletes a specific finalized session from history.
    */
   async deleteHistorySession(sessionId: string): Promise<void> {
     try {
-      const cp = await this.metadataStore.readSession(sessionId);
-
-      await this.metadataStore.delete(sessionId);
-      await this.metadataStore.deleteSession(sessionId);
+      await this.deleteHistorySessionInternal(sessionId);
 
       // Run Garbage Collector immediately
       if (this.gcEnabled) {

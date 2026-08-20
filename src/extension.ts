@@ -14,6 +14,7 @@ import { JGuardCodeLensProvider } from './vscode/CodeLensProvider';
 import { StashStore } from './storage/StashStore';
 import { StashService } from './application/StashService';
 import { StashTreeProvider, StashedChangeTreeItem } from './vscode/StashTreeProvider';
+import { AttributionEngine } from './core/AttributionEngine';
 import * as path from 'path';
 import * as fs from 'fs/promises';
 import { IgnoreManager } from './core/IgnoreManager';
@@ -68,16 +69,18 @@ export async function activate(context: vscode.ExtensionContext) {
   const historyProvider = new HistoryTreeProvider(metadataStore);
   const stashProvider = new StashTreeProvider(stashService);
   const diffProvider = new DiffProvider(objectStore);
+  const attributionEngine = new AttributionEngine();
 
   context.subscriptions.push(
     vscode.window.registerTreeDataProvider('jguardSidebar', sidebarProvider),
     vscode.window.registerTreeDataProvider('jguardHistory', historyProvider),
-    vscode.window.registerTreeDataProvider('jguardStash', stashProvider)
+    vscode.window.registerTreeDataProvider('jguardStash', stashProvider),
+    vscode.workspace.onDidChangeTextDocument(e => attributionEngine.trackEditorChange(e))
   );
   vscode.workspace.registerTextDocumentContentProvider(DiffProvider.scheme, diffProvider);
 
-  // Register commands — L2/L6: now receives objectStore for per-file snapshots and binary diffs
-  commands = new Commands(context, checkpointService, restoreService, scanner, sidebarProvider, statusBar, objectStore, ignoreManager);
+  // Register commands
+  commands = new Commands(context, checkpointService, restoreService, scanner, sidebarProvider, statusBar, objectStore, ignoreManager, attributionEngine);
   commands.register();
 
   // Register CodeLensProvider
@@ -162,6 +165,7 @@ export async function activate(context: vscode.ExtensionContext) {
       if (item && item.stash) {
         try {
           await stashService.popStash(item.stash.id);
+          vscode.commands.executeCommand('jguard.refresh');
           stashProvider.refresh();
           vscode.window.showInformationMessage(`JGuard: Popped stash for ${item.stash.relativePath}`);
         } catch (e: any) {
@@ -173,6 +177,7 @@ export async function activate(context: vscode.ExtensionContext) {
       if (item && item.stash) {
         try {
           await stashService.applyStash(item.stash.id);
+          vscode.commands.executeCommand('jguard.refresh');
           vscode.window.showInformationMessage(`JGuard: Applied stash for ${item.stash.relativePath}`);
         } catch (e: any) {
           vscode.window.showErrorMessage(`Failed to apply stash: ${e.message}`);

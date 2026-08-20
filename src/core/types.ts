@@ -36,9 +36,9 @@ export interface SessionUIState {
 }
 
 export type FileChange = 
-  | { type: 'created'; relativePath: string; currentHash: string }
-  | { type: 'modified'; relativePath: string; checkpointHash: string; currentHash: string }
-  | { type: 'deleted'; relativePath: string; checkpointHash: string };
+  | { type: 'created'; relativePath: string; currentHash: string; attribution?: 'human' | 'ai' | 'git' }
+  | { type: 'modified'; relativePath: string; checkpointHash: string; currentHash: string; attribution?: 'human' | 'ai' | 'git' }
+  | { type: 'deleted'; relativePath: string; checkpointHash: string; attribution?: 'human' | 'ai' | 'git' };
 
 /**
  * L2: Per-file decision state for granular accept/reject.

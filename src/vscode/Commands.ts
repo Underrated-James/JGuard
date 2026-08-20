@@ -16,6 +16,7 @@ import { ObjectStore } from '../storage/ObjectStore';
 import { BatchedWatcherQueue } from './BatchedWatcherQueue';
 import { BranchWatcher } from './BranchWatcher';
 import { IgnoreManager } from '../core/IgnoreManager';
+import { AttributionEngine } from '../core/AttributionEngine';
 
 export class Commands {
   // L1: Session-based state (multi-root)
@@ -55,7 +56,8 @@ export class Commands {
     private sidebar: SidebarProvider,
     private statusBar: StatusBar,
     private objectStore: ObjectStore,
-    private ignoreManager: IgnoreManager
+    private ignoreManager: IgnoreManager,
+    private attributionEngine: AttributionEngine
   ) {
     this.branchWatcher = new BranchWatcher();
     this.context.subscriptions.push(this.branchWatcher);
@@ -95,6 +97,7 @@ export class Commands {
 
     const onDidChange = (uri: vscode.Uri) => {
       if (this.ignoreManager.isIgnored(uri.fsPath)) return;
+      this.attributionEngine.trackExternalChange(uri.fsPath);
       watcherQueue.enqueue(uri);
     };
     
@@ -186,7 +189,7 @@ export class Commands {
     let totalCount = 0;
 
     for (const [wsRoot, checkpoint] of Object.entries(this.activeSession.folderCheckpoints)) {
-      const changeSet = await ChangeDetector.detectChanges(checkpoint, this.scanner, wsRoot);
+      const changeSet = await ChangeDetector.detectChanges(checkpoint, this.scanner, wsRoot, this.attributionEngine);
       
       // Preserve existing decisions for files across refreshes
       const existingCs = previousChangeSets.get(wsRoot);
@@ -288,7 +291,7 @@ export class Commands {
       const existingCs = this.changeSets.get(wsRoot);
 
       if (checkpoint && existingCs) {
-        const newChangeSet = await ChangeDetector.detectDelta(checkpoint, wsRoot, dirtyPaths, existingCs);
+        const newChangeSet = await ChangeDetector.detectDelta(checkpoint, wsRoot, dirtyPaths, existingCs, this.attributionEngine);
         
         // Retain toggled/rejected files that were dropped because they now match the checkpoint
         for (const change of existingCs.changes) {
@@ -308,7 +311,7 @@ export class Commands {
         this.changeSets.set(wsRoot, newChangeSet);
       } else if (checkpoint && !existingCs) {
         // Fallback to full refresh if no existing changeset
-        const changeSet = await ChangeDetector.detectChanges(checkpoint, this.scanner, wsRoot);
+        const changeSet = await ChangeDetector.detectChanges(checkpoint, this.scanner, wsRoot, this.attributionEngine);
         this.changeSets.set(wsRoot, changeSet);
       }
     }
@@ -396,7 +399,7 @@ export class Commands {
 
           // L1: Restore each folder to its original state
           for (const [wsRoot, checkpoint] of Object.entries(this.activeSession!.folderCheckpoints)) {
-            const changeSet = await ChangeDetector.detectChanges(checkpoint, this.scanner, wsRoot);
+            const changeSet = await ChangeDetector.detectChanges(checkpoint, this.scanner, wsRoot, this.attributionEngine);
             const plan = RestorePlanner.buildPlan(checkpoint, changeSet, [], wsRoot);
             await this.restoreService.execute(plan);
           }
@@ -419,7 +422,7 @@ export class Commands {
           if (!this.forwardSession) return;
 
           for (const [wsRoot, checkpoint] of Object.entries(this.forwardSession.folderCheckpoints)) {
-            const forwardChangeSet = await ChangeDetector.detectChanges(checkpoint, this.scanner, wsRoot);
+            const forwardChangeSet = await ChangeDetector.detectChanges(checkpoint, this.scanner, wsRoot, this.attributionEngine);
             const plan = RestorePlanner.buildPlan(checkpoint, forwardChangeSet, [], wsRoot);
             await this.restoreService.execute(plan);
           }
@@ -672,7 +675,7 @@ export class Commands {
 
     // L1: Reject across all folders
     for (const [wsRoot, checkpoint] of Object.entries(this.activeSession.folderCheckpoints)) {
-      const changeSet = await ChangeDetector.detectChanges(checkpoint, this.scanner, wsRoot);
+      const changeSet = await ChangeDetector.detectChanges(checkpoint, this.scanner, wsRoot, this.attributionEngine);
       const conflicts = await ConflictDetector.detect(changeSet, this.scanner, wsRoot);
       
       if (conflicts.length > 0) {

@@ -495,7 +495,7 @@ __export(extension_exports, {
   deactivate: () => deactivate
 });
 module.exports = __toCommonJS(extension_exports);
-var vscode11 = __toESM(require("vscode"));
+var vscode12 = __toESM(require("vscode"));
 
 // src/storage/MetadataStore.ts
 var fs = __toESM(require("fs/promises"));
@@ -1112,22 +1112,22 @@ var CheckpointService = class {
    * Manually clears old finalized sessions from history, keeping only the 3 most recent ones.
    */
   async clearOldHistory(keepCount = 3) {
-    const checkpointsDir = this.metadataStore.getCheckpointsDir();
     try {
-      const dirFiles = await fs5.readdir(checkpointsDir);
-      const cpFiles = dirFiles.filter((f) => f.endsWith(".json"));
-      const checkpoints = [];
-      for (const f of cpFiles) {
-        const id = f.replace(".json", "");
-        const cp = await this.metadataStore.read(id);
-        checkpoints.push({ id, createdAt: cp.createdAt, status: cp.status });
+      const sessionIds = await this.metadataStore.listSessions();
+      const sessions = [];
+      for (const id of sessionIds) {
+        try {
+          const session = await this.metadataStore.readSession(id);
+          sessions.push(session);
+        } catch (e) {
+          console.error(`Failed to read session ${id}`, e);
+        }
       }
-      checkpoints.sort((a, b) => b.createdAt - a.createdAt);
-      const finalized = checkpoints.filter((cp) => cp.status !== "active");
+      sessions.sort((a, b) => b.createdAt - a.createdAt);
+      const finalized = sessions.filter((session) => session.status !== "active");
       let deletedCount = 0;
       for (let i = keepCount; i < finalized.length; i++) {
-        await this.metadataStore.delete(finalized[i].id);
-        await this.metadataStore.deleteSession(finalized[i].id);
+        await this.deleteHistorySessionInternal(finalized[i].id);
         deletedCount++;
       }
       if (this.gcEnabled && deletedCount > 0) {
@@ -1142,13 +1142,23 @@ var CheckpointService = class {
     }
   }
   /**
+   * Internal helper that deletes a session without running GC, so we can bulk delete efficiently.
+   */
+  async deleteHistorySessionInternal(sessionId) {
+    const cp = await this.metadataStore.readSession(sessionId);
+    if (cp.folderCheckpoints) {
+      for (const checkpoint of Object.values(cp.folderCheckpoints)) {
+        await this.metadataStore.delete(checkpoint.id);
+      }
+    }
+    await this.metadataStore.deleteSession(sessionId);
+  }
+  /**
    * Deletes a specific finalized session from history.
    */
   async deleteHistorySession(sessionId) {
     try {
-      const cp = await this.metadataStore.readSession(sessionId);
-      await this.metadataStore.delete(sessionId);
-      await this.metadataStore.deleteSession(sessionId);
+      await this.deleteHistorySessionInternal(sessionId);
       if (this.gcEnabled) {
         const storageBaseDir = this.metadataStore.storageBaseDir;
         const gc = new BlobGarbageCollector(this.metadataStore, this.objectStore, storageBaseDir);
@@ -1184,16 +1194,16 @@ var RestoreService = class {
           throw new Error(`Hash mismatch during restore of ${op.relativePath}`);
         }
         try {
-          const vscode12 = require("vscode");
-          await vscode12.workspace.fs.writeFile(vscode12.Uri.file(op.absolutePath), content);
+          const vscode13 = require("vscode");
+          await vscode13.workspace.fs.writeFile(vscode13.Uri.file(op.absolutePath), content);
         } catch (e) {
           await fs6.writeFile(op.absolutePath, content);
         }
       } else if (op.type === "delete") {
         try {
           try {
-            const vscode12 = require("vscode");
-            await vscode12.workspace.fs.delete(vscode12.Uri.file(op.absolutePath), { useTrash: false });
+            const vscode13 = require("vscode");
+            await vscode13.workspace.fs.delete(vscode13.Uri.file(op.absolutePath), { useTrash: false });
           } catch (e) {
             await fs6.unlink(op.absolutePath);
           }
@@ -1346,15 +1356,22 @@ var GuardTreeItem = class extends vscode3.TreeItem {
     this.isBinary = isBinary;
     if (change) {
       this.tooltip = this.buildTooltip(change);
+      let attrLabel = "";
+      if (change.attribution === "human")
+        attrLabel = " (Human)";
+      else if (change.attribution === "ai")
+        attrLabel = " (AI)";
+      else if (change.attribution === "git")
+        attrLabel = " (Git)";
       if (decision === "accepted") {
-        this.description = `${change.type} \u2713 accepted`;
+        this.description = `${change.type}${attrLabel} \u2713 accepted`;
       } else if (decision === "rejected") {
-        this.description = `${change.type} \u2717 rejected`;
+        this.description = `${change.type}${attrLabel} \u2717 rejected`;
       } else {
         if (fileViewState === "original") {
-          this.description = `${change.type} (showing original)`;
+          this.description = `${change.type}${attrLabel} (showing original)`;
         } else {
-          this.description = change.type;
+          this.description = `${change.type}${attrLabel}`;
         }
       }
       if (decision === "accepted") {
@@ -1391,8 +1408,16 @@ var GuardTreeItem = class extends vscode3.TreeItem {
 
 `);
     md.appendMarkdown(`Type: \`${change.type}\`
+`);
+    if (change.attribution) {
+      const attrLabel = change.attribution === "ai" ? "AI" : change.attribution === "human" ? "Human" : "Git / External";
+      md.appendMarkdown(`Attribution: \`${attrLabel}\`
 
 `);
+    } else {
+      md.appendMarkdown(`
+`);
+    }
     md.appendMarkdown(`Click to view diff \u2022 Use inline buttons to Accept \u2713, Reject \u2717, or Toggle \u{1F441}`);
     return md;
   }
@@ -1525,7 +1550,7 @@ var ChangeDetector = class {
    * @param scanner The scanner used to get the current file states.
    * @param workspaceRoot Absolute path to the workspace root.
    */
-  static async detectChanges(checkpoint, scanner, workspaceRoot) {
+  static async detectChanges(checkpoint, scanner, workspaceRoot, attributionEngine) {
     const currentPaths = await scanner.scan();
     const changes = [];
     const aiStateHashes = {};
@@ -1534,7 +1559,8 @@ var ChangeDetector = class {
         changes.push({
           type: "deleted",
           relativePath: relPath,
-          checkpointHash: snapshot.hash
+          checkpointHash: snapshot.hash,
+          attribution: attributionEngine?.getAttribution(path7.join(workspaceRoot, relPath))
         });
       } else {
         const current = currentPaths.get(relPath);
@@ -1548,7 +1574,8 @@ var ChangeDetector = class {
             type: "modified",
             relativePath: relPath,
             checkpointHash: snapshot.hash,
-            currentHash
+            currentHash,
+            attribution: attributionEngine?.getAttribution(absPath)
           });
           aiStateHashes[relPath] = currentHash;
         }
@@ -1561,7 +1588,8 @@ var ChangeDetector = class {
         changes.push({
           type: "created",
           relativePath: relPath,
-          currentHash
+          currentHash,
+          attribution: attributionEngine?.getAttribution(absPath)
         });
         aiStateHashes[relPath] = currentHash;
       }
@@ -1585,7 +1613,7 @@ var ChangeDetector = class {
    * @param dirtyPaths Array of relative paths that were modified.
    * @param existingChangeSet The previous ChangeSet to update.
    */
-  static async detectDelta(checkpoint, workspaceRoot, dirtyPaths, existingChangeSet) {
+  static async detectDelta(checkpoint, workspaceRoot, dirtyPaths, existingChangeSet, attributionEngine) {
     const newChangeSet = {
       checkpointId: existingChangeSet.checkpointId,
       computedAt: Date.now(),
@@ -1615,7 +1643,8 @@ var ChangeDetector = class {
           newChangeSet.changes.push({
             type: "deleted",
             relativePath: relPath,
-            checkpointHash: snapshot.hash
+            checkpointHash: snapshot.hash,
+            attribution: attributionEngine?.getAttribution(absPath)
           });
           newChangeSet.decisions[relPath] = newChangeSet.decisions[relPath] ?? "pending";
         } else if (currentHash !== snapshot.hash) {
@@ -1623,7 +1652,8 @@ var ChangeDetector = class {
             type: "modified",
             relativePath: relPath,
             checkpointHash: snapshot.hash,
-            currentHash
+            currentHash,
+            attribution: attributionEngine?.getAttribution(absPath)
           });
           newChangeSet.aiStateHashes[relPath] = currentHash;
           newChangeSet.decisions[relPath] = newChangeSet.decisions[relPath] ?? "pending";
@@ -1633,7 +1663,8 @@ var ChangeDetector = class {
           newChangeSet.changes.push({
             type: "created",
             relativePath: relPath,
-            currentHash
+            currentHash,
+            attribution: attributionEngine?.getAttribution(absPath)
           });
           newChangeSet.aiStateHashes[relPath] = currentHash;
           newChangeSet.decisions[relPath] = newChangeSet.decisions[relPath] ?? "pending";
@@ -1919,7 +1950,7 @@ var BranchWatcher = class {
 
 // src/vscode/Commands.ts
 var Commands = class {
-  constructor(context, checkpointService, restoreService, scanner, sidebar, statusBar2, objectStore, ignoreManager) {
+  constructor(context, checkpointService, restoreService, scanner, sidebar, statusBar2, objectStore, ignoreManager, attributionEngine) {
     this.context = context;
     this.checkpointService = checkpointService;
     this.restoreService = restoreService;
@@ -1928,6 +1959,7 @@ var Commands = class {
     this.statusBar = statusBar2;
     this.objectStore = objectStore;
     this.ignoreManager = ignoreManager;
+    this.attributionEngine = attributionEngine;
     this.branchWatcher = new BranchWatcher();
     this.context.subscriptions.push(this.branchWatcher);
     this.context.subscriptions.push(
@@ -1986,6 +2018,7 @@ var Commands = class {
     const onDidChange = (uri) => {
       if (this.ignoreManager.isIgnored(uri.fsPath))
         return;
+      this.attributionEngine.trackExternalChange(uri.fsPath);
       watcherQueue.enqueue(uri);
     };
     this.context.subscriptions.push(
@@ -2062,7 +2095,7 @@ var Commands = class {
     this.changeSets.clear();
     let totalCount = 0;
     for (const [wsRoot, checkpoint] of Object.entries(this.activeSession.folderCheckpoints)) {
-      const changeSet = await ChangeDetector.detectChanges(checkpoint, this.scanner, wsRoot);
+      const changeSet = await ChangeDetector.detectChanges(checkpoint, this.scanner, wsRoot, this.attributionEngine);
       const existingCs = previousChangeSets.get(wsRoot);
       const savedDecisions = this.activeSession.uiState?.decisions?.[wsRoot];
       for (const change of changeSet.changes) {
@@ -2145,7 +2178,7 @@ var Commands = class {
       const checkpoint = this.activeSession.folderCheckpoints[wsRoot];
       const existingCs = this.changeSets.get(wsRoot);
       if (checkpoint && existingCs) {
-        const newChangeSet = await ChangeDetector.detectDelta(checkpoint, wsRoot, dirtyPaths, existingCs);
+        const newChangeSet = await ChangeDetector.detectDelta(checkpoint, wsRoot, dirtyPaths, existingCs, this.attributionEngine);
         for (const change of existingCs.changes) {
           if (!newChangeSet.changes.find((c) => c.relativePath === change.relativePath)) {
             const viewState = this.fileViewStates.get(change.relativePath);
@@ -2161,7 +2194,7 @@ var Commands = class {
         }
         this.changeSets.set(wsRoot, newChangeSet);
       } else if (checkpoint && !existingCs) {
-        const changeSet = await ChangeDetector.detectChanges(checkpoint, this.scanner, wsRoot);
+        const changeSet = await ChangeDetector.detectChanges(checkpoint, this.scanner, wsRoot, this.attributionEngine);
         this.changeSets.set(wsRoot, changeSet);
       }
     }
@@ -2228,7 +2261,7 @@ Current state differs`
           const lockFile = path12.join(this.checkpointService.metadataStore.storageBaseDir, "jguard.lock");
           await fs9.writeFile(lockFile, this.activeSession.id, "utf-8");
           for (const [wsRoot, checkpoint] of Object.entries(this.activeSession.folderCheckpoints)) {
-            const changeSet = await ChangeDetector.detectChanges(checkpoint, this.scanner, wsRoot);
+            const changeSet = await ChangeDetector.detectChanges(checkpoint, this.scanner, wsRoot, this.attributionEngine);
             const plan = RestorePlanner.buildPlan(checkpoint, changeSet, [], wsRoot);
             await this.restoreService.execute(plan);
           }
@@ -2246,7 +2279,7 @@ Current state differs`
           if (!this.forwardSession)
             return;
           for (const [wsRoot, checkpoint] of Object.entries(this.forwardSession.folderCheckpoints)) {
-            const forwardChangeSet = await ChangeDetector.detectChanges(checkpoint, this.scanner, wsRoot);
+            const forwardChangeSet = await ChangeDetector.detectChanges(checkpoint, this.scanner, wsRoot, this.attributionEngine);
             const plan = RestorePlanner.buildPlan(checkpoint, forwardChangeSet, [], wsRoot);
             await this.restoreService.execute(plan);
           }
@@ -2448,7 +2481,7 @@ Current state differs`
     }
     await vscode6.commands.executeCommand("workbench.action.files.saveAll");
     for (const [wsRoot, checkpoint] of Object.entries(this.activeSession.folderCheckpoints)) {
-      const changeSet = await ChangeDetector.detectChanges(checkpoint, this.scanner, wsRoot);
+      const changeSet = await ChangeDetector.detectChanges(checkpoint, this.scanner, wsRoot, this.attributionEngine);
       const conflicts = await ConflictDetector.detect(changeSet, this.scanner, wsRoot);
       if (conflicts.length > 0) {
         this.statusBar.setState("conflict");
@@ -4136,6 +4169,78 @@ var StashTreeProvider = class {
   }
 };
 
+// src/core/AttributionEngine.ts
+var vscode11 = __toESM(require("vscode"));
+var AttributionEngine = class {
+  attributions = /* @__PURE__ */ new Map();
+  lastEditorChange = /* @__PURE__ */ new Map();
+  streamingStats = /* @__PURE__ */ new Map();
+  getAttribution(absPath) {
+    return this.attributions.get(absPath);
+  }
+  clear() {
+    this.attributions.clear();
+    this.lastEditorChange.clear();
+    this.streamingStats.clear();
+  }
+  async trackEditorChange(event) {
+    if (event.document.uri.scheme !== "file")
+      return;
+    const absPath = event.document.uri.fsPath;
+    this.lastEditorChange.set(absPath, Date.now());
+    let totalAdded = 0;
+    let isMassiveReplace = false;
+    for (const change of event.contentChanges) {
+      totalAdded += change.text.length;
+      if (change.rangeLength > 100 && Math.abs(change.rangeLength - change.text.length) < 50) {
+        isMassiveReplace = true;
+      }
+    }
+    if (totalAdded === 0 && event.contentChanges.some((c) => c.rangeLength > 0)) {
+      this.attributions.set(absPath, "human");
+      return;
+    }
+    if (totalAdded > 50) {
+      if (isMassiveReplace) {
+        this.attributions.set(absPath, "human");
+        return;
+      }
+      try {
+        const clipboardText = await vscode11.env.clipboard.readText();
+        if (event.contentChanges.some((c) => c.text === clipboardText || clipboardText.includes(c.text))) {
+          this.attributions.set(absPath, "human");
+          return;
+        }
+      } catch (e) {
+      }
+      this.attributions.set(absPath, "ai");
+      return;
+    }
+    const now = Date.now();
+    let stats = this.streamingStats.get(absPath);
+    if (!stats || now - stats.startTime > 2e3) {
+      stats = { charsAdded: 0, startTime: now };
+    }
+    stats.charsAdded += totalAdded;
+    this.streamingStats.set(absPath, stats);
+    if (stats.charsAdded > 100 && now - stats.startTime < 1e3) {
+      this.attributions.set(absPath, "ai");
+    } else {
+      const current = this.attributions.get(absPath);
+      if (current !== "ai") {
+        this.attributions.set(absPath, "human");
+      }
+    }
+  }
+  trackExternalChange(absPath) {
+    const lastChange = this.lastEditorChange.get(absPath);
+    const now = Date.now();
+    if (!lastChange || now - lastChange > 2e3) {
+      this.attributions.set(absPath, "git");
+    }
+  }
+};
+
 // src/extension.ts
 var path18 = __toESM(require("path"));
 var fs12 = __toESM(require("fs/promises"));
@@ -4225,8 +4330,8 @@ async function activate(context) {
   await objectStore.initialize();
   await stashStore.initialize();
   let wsRoot = "";
-  if (vscode11.workspace.workspaceFolders && vscode11.workspace.workspaceFolders.length > 0) {
-    wsRoot = vscode11.workspace.workspaceFolders[0].uri.fsPath;
+  if (vscode12.workspace.workspaceFolders && vscode12.workspace.workspaceFolders.length > 0) {
+    wsRoot = vscode12.workspace.workspaceFolders[0].uri.fsPath;
   }
   const ignoreManager = new IgnoreManager(wsRoot);
   await ignoreManager.initialize();
@@ -4234,12 +4339,12 @@ async function activate(context) {
   const checkpointService = new CheckpointService(metadataStore, objectStore, scanner, wsRoot);
   const restoreService = new RestoreService(objectStore);
   const stashService = new StashService(stashStore, objectStore, restoreService);
-  const gcEnabled = vscode11.workspace.getConfiguration("jguard").get("enableGarbageCollection", true);
+  const gcEnabled = vscode12.workspace.getConfiguration("jguard").get("enableGarbageCollection", true);
   checkpointService.setGCEnabled(gcEnabled);
   context.subscriptions.push(
-    vscode11.workspace.onDidChangeConfiguration((e) => {
+    vscode12.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration("jguard.enableGarbageCollection")) {
-        const enabled = vscode11.workspace.getConfiguration("jguard").get("enableGarbageCollection", true);
+        const enabled = vscode12.workspace.getConfiguration("jguard").get("enableGarbageCollection", true);
         checkpointService.setGCEnabled(enabled);
       }
     })
@@ -4249,24 +4354,26 @@ async function activate(context) {
   const historyProvider = new HistoryTreeProvider(metadataStore);
   const stashProvider = new StashTreeProvider(stashService);
   const diffProvider = new DiffProvider(objectStore);
+  const attributionEngine = new AttributionEngine();
   context.subscriptions.push(
-    vscode11.window.registerTreeDataProvider("jguardSidebar", sidebarProvider),
-    vscode11.window.registerTreeDataProvider("jguardHistory", historyProvider),
-    vscode11.window.registerTreeDataProvider("jguardStash", stashProvider)
+    vscode12.window.registerTreeDataProvider("jguardSidebar", sidebarProvider),
+    vscode12.window.registerTreeDataProvider("jguardHistory", historyProvider),
+    vscode12.window.registerTreeDataProvider("jguardStash", stashProvider),
+    vscode12.workspace.onDidChangeTextDocument((e) => attributionEngine.trackEditorChange(e))
   );
-  vscode11.workspace.registerTextDocumentContentProvider(DiffProvider.scheme, diffProvider);
-  commands4 = new Commands(context, checkpointService, restoreService, scanner, sidebarProvider, statusBar, objectStore, ignoreManager);
+  vscode12.workspace.registerTextDocumentContentProvider(DiffProvider.scheme, diffProvider);
+  commands4 = new Commands(context, checkpointService, restoreService, scanner, sidebarProvider, statusBar, objectStore, ignoreManager, attributionEngine);
   commands4.register();
   const codeLensProvider = new JGuardCodeLensProvider(commands4, objectStore);
-  vscode11.languages.registerCodeLensProvider({ scheme: "file" }, codeLensProvider);
+  vscode12.languages.registerCodeLensProvider({ scheme: "file" }, codeLensProvider);
   context.subscriptions.push(
-    vscode11.commands.registerCommand("jguard.showHistoryDetails", (item) => {
+    vscode12.commands.registerCommand("jguard.showHistoryDetails", (item) => {
       if (item && item.session) {
         CheckpointDetailWebview.show(context, item.session);
       }
     }),
-    vscode11.commands.registerCommand("jguard.clearHistory", async () => {
-      const choice = await vscode11.window.showWarningMessage(
+    vscode12.commands.registerCommand("jguard.clearHistory", async () => {
+      const choice = await vscode12.window.showWarningMessage(
         "Are you sure you want to bulk clear old sessions? (This will keep your 3 most recent sessions)",
         "Clear Old History",
         "Cancel"
@@ -4275,19 +4382,19 @@ async function activate(context) {
         try {
           await checkpointService.clearOldHistory(3);
           historyProvider.refresh();
-          vscode11.window.showInformationMessage("JGuard: Old session history cleared successfully.");
+          vscode12.window.showInformationMessage("JGuard: Old session history cleared successfully.");
         } catch (e) {
-          vscode11.window.showErrorMessage(`Failed to clear history: ${e.message}`);
+          vscode12.window.showErrorMessage(`Failed to clear history: ${e.message}`);
         }
       }
     }),
-    vscode11.commands.registerCommand("jguard.deleteHistorySession", async (item) => {
+    vscode12.commands.registerCommand("jguard.deleteHistorySession", async (item) => {
       if (item && item.session) {
         if (commands4.getActiveSessionId() === item.session.id) {
-          vscode11.window.showErrorMessage("You cannot delete the active session that you are currently protecting in your editor.");
+          vscode12.window.showErrorMessage("You cannot delete the active session that you are currently protecting in your editor.");
           return;
         }
-        const choice = await vscode11.window.showWarningMessage(
+        const choice = await vscode12.window.showWarningMessage(
           "Are you sure you want to delete this specific session? This will permanently delete its checkpoint data.",
           "Delete Session",
           "Cancel"
@@ -4296,17 +4403,17 @@ async function activate(context) {
           try {
             await checkpointService.deleteHistorySession(item.session.id);
             historyProvider.refresh();
-            vscode11.window.showInformationMessage("JGuard: Session deleted successfully.");
+            vscode12.window.showInformationMessage("JGuard: Session deleted successfully.");
           } catch (e) {
-            vscode11.window.showErrorMessage(`Failed to delete session: ${e.message}`);
+            vscode12.window.showErrorMessage(`Failed to delete session: ${e.message}`);
           }
         }
       }
     }),
-    vscode11.commands.registerCommand("jguard.refreshHistory", () => {
+    vscode12.commands.registerCommand("jguard.refreshHistory", () => {
       historyProvider.refresh();
     }),
-    vscode11.commands.registerCommand("jguard.stashFile", async (item) => {
+    vscode12.commands.registerCommand("jguard.stashFile", async (item) => {
       if (item && item.change) {
         const change = item.change;
         const activeId = commands4.getActiveSessionId();
@@ -4314,48 +4421,50 @@ async function activate(context) {
           return;
         try {
           await stashService.stashChange(
-            item.wsRoot || vscode11.workspace.workspaceFolders[0].uri.fsPath,
+            item.wsRoot || vscode12.workspace.workspaceFolders[0].uri.fsPath,
             change.relativePath,
             change.type === "created" ? null : change.checkpointHash,
             change.type === "deleted" ? null : change.currentHash
           );
-          vscode11.commands.executeCommand("jguard.refresh");
+          vscode12.commands.executeCommand("jguard.refresh");
           stashProvider.refresh();
-          vscode11.window.showInformationMessage(`JGuard: Stashed ${change.relativePath}`);
+          vscode12.window.showInformationMessage(`JGuard: Stashed ${change.relativePath}`);
         } catch (e) {
-          vscode11.window.showErrorMessage(`Failed to stash: ${e.message}`);
+          vscode12.window.showErrorMessage(`Failed to stash: ${e.message}`);
         }
       }
     }),
-    vscode11.commands.registerCommand("jguard.popStash", async (item) => {
+    vscode12.commands.registerCommand("jguard.popStash", async (item) => {
       if (item && item.stash) {
         try {
           await stashService.popStash(item.stash.id);
+          vscode12.commands.executeCommand("jguard.refresh");
           stashProvider.refresh();
-          vscode11.window.showInformationMessage(`JGuard: Popped stash for ${item.stash.relativePath}`);
+          vscode12.window.showInformationMessage(`JGuard: Popped stash for ${item.stash.relativePath}`);
         } catch (e) {
-          vscode11.window.showErrorMessage(`Failed to pop stash: ${e.message}`);
+          vscode12.window.showErrorMessage(`Failed to pop stash: ${e.message}`);
         }
       }
     }),
-    vscode11.commands.registerCommand("jguard.applyStash", async (item) => {
+    vscode12.commands.registerCommand("jguard.applyStash", async (item) => {
       if (item && item.stash) {
         try {
           await stashService.applyStash(item.stash.id);
-          vscode11.window.showInformationMessage(`JGuard: Applied stash for ${item.stash.relativePath}`);
+          vscode12.commands.executeCommand("jguard.refresh");
+          vscode12.window.showInformationMessage(`JGuard: Applied stash for ${item.stash.relativePath}`);
         } catch (e) {
-          vscode11.window.showErrorMessage(`Failed to apply stash: ${e.message}`);
+          vscode12.window.showErrorMessage(`Failed to apply stash: ${e.message}`);
         }
       }
     }),
-    vscode11.commands.registerCommand("jguard.dropStash", async (item) => {
+    vscode12.commands.registerCommand("jguard.dropStash", async (item) => {
       if (item && item.stash) {
         try {
           await stashService.dropStash(item.stash.id);
           stashProvider.refresh();
-          vscode11.window.showInformationMessage(`JGuard: Dropped stash for ${item.stash.relativePath}`);
+          vscode12.window.showInformationMessage(`JGuard: Dropped stash for ${item.stash.relativePath}`);
         } catch (e) {
-          vscode11.window.showErrorMessage(`Failed to drop stash: ${e.message}`);
+          vscode12.window.showErrorMessage(`Failed to drop stash: ${e.message}`);
         }
       }
     })
@@ -4369,7 +4478,7 @@ async function activate(context) {
   try {
     const activeId = await fs12.readFile(lockFile, "utf-8");
     if (activeId) {
-      vscode11.window.showWarningMessage(
+      vscode12.window.showWarningMessage(
         "AI Guard: Found an active checkpoint from a previous session. Do you want to resume protecting?",
         "Resume",
         "Discard"
@@ -4381,7 +4490,7 @@ async function activate(context) {
               session = await metadataStore.readSession(activeId.trim());
             } catch {
               const cp = await metadataStore.read(activeId.trim());
-              const wsRoot2 = cp.workspaceRoot || (vscode11.workspace.workspaceFolders?.[0]?.uri.fsPath || "");
+              const wsRoot2 = cp.workspaceRoot || (vscode12.workspace.workspaceFolders?.[0]?.uri.fsPath || "");
               session = {
                 id: activeId.trim(),
                 createdAt: cp.createdAt,
@@ -4393,7 +4502,7 @@ async function activate(context) {
             statusBar.setState("protecting");
             await commands4.refresh();
           } catch (e) {
-            vscode11.window.showErrorMessage("Failed to resume checkpoint. It may be corrupted.");
+            vscode12.window.showErrorMessage("Failed to resume checkpoint. It may be corrupted.");
             await fs12.unlink(lockFile).catch(() => {
             });
           }

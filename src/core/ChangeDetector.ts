@@ -1,5 +1,6 @@
 import { Checkpoint, ChangeSet, FileChange, FileMeta, IFileScanner } from './types';
 import { Hasher } from './Hasher';
+import { AttributionEngine } from './AttributionEngine';
 import * as path from 'path';
 
 export class ChangeDetector {
@@ -12,7 +13,8 @@ export class ChangeDetector {
   static async detectChanges(
     checkpoint: Checkpoint,
     scanner: IFileScanner,
-    workspaceRoot: string
+    workspaceRoot: string,
+    attributionEngine?: AttributionEngine
   ): Promise<ChangeSet> {
     const currentPaths = await scanner.scan();
     const changes: FileChange[] = [];
@@ -26,6 +28,7 @@ export class ChangeDetector {
           type: 'deleted',
           relativePath: relPath,
           checkpointHash: snapshot.hash,
+          attribution: attributionEngine?.getAttribution(path.join(workspaceRoot, relPath))
         });
       } else {
         const current = currentPaths.get(relPath)!;
@@ -45,6 +48,7 @@ export class ChangeDetector {
             relativePath: relPath,
             checkpointHash: snapshot.hash,
             currentHash,
+            attribution: attributionEngine?.getAttribution(absPath)
           });
           aiStateHashes[relPath] = currentHash;
         }
@@ -62,6 +66,7 @@ export class ChangeDetector {
           type: 'created',
           relativePath: relPath,
           currentHash,
+          attribution: attributionEngine?.getAttribution(absPath)
         });
         aiStateHashes[relPath] = currentHash;
       }
@@ -93,7 +98,8 @@ export class ChangeDetector {
     checkpoint: Checkpoint,
     workspaceRoot: string,
     dirtyPaths: string[],
-    existingChangeSet: ChangeSet
+    existingChangeSet: ChangeSet,
+    attributionEngine?: AttributionEngine
   ): Promise<ChangeSet> {
     const newChangeSet: ChangeSet = {
       checkpointId: existingChangeSet.checkpointId,
@@ -133,6 +139,7 @@ export class ChangeDetector {
             type: 'deleted',
             relativePath: relPath,
             checkpointHash: snapshot.hash,
+            attribution: attributionEngine?.getAttribution(absPath)
           });
           newChangeSet.decisions[relPath] = newChangeSet.decisions[relPath] ?? 'pending';
         } else if (currentHash !== snapshot.hash) {
@@ -142,6 +149,7 @@ export class ChangeDetector {
             relativePath: relPath,
             checkpointHash: snapshot.hash,
             currentHash: currentHash!,
+            attribution: attributionEngine?.getAttribution(absPath)
           });
           newChangeSet.aiStateHashes[relPath] = currentHash!;
           newChangeSet.decisions[relPath] = newChangeSet.decisions[relPath] ?? 'pending';
@@ -153,6 +161,7 @@ export class ChangeDetector {
             type: 'created',
             relativePath: relPath,
             currentHash: currentHash!,
+            attribution: attributionEngine?.getAttribution(absPath)
           });
           newChangeSet.aiStateHashes[relPath] = currentHash!;
           newChangeSet.decisions[relPath] = newChangeSet.decisions[relPath] ?? 'pending';

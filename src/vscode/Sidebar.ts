@@ -15,17 +15,22 @@ export class GuardTreeItem extends vscode.TreeItem {
     if (change) {
       this.tooltip = this.buildTooltip(change);
       
+      let attrLabel = '';
+      if (change.attribution === 'human') attrLabel = ' (Human)';
+      else if (change.attribution === 'ai') attrLabel = ' (AI)';
+      else if (change.attribution === 'git') attrLabel = ' (Git)';
+
       // L2: Show decision state in description
       if (decision === 'accepted') {
-        this.description = `${change.type} ✓ accepted`;
+        this.description = `${change.type}${attrLabel} ✓ accepted`;
       } else if (decision === 'rejected') {
-        this.description = `${change.type} ✗ rejected`;
+        this.description = `${change.type}${attrLabel} ✗ rejected`;
       } else {
         // L3: Show view state
         if (fileViewState === 'original') {
-          this.description = `${change.type} (showing original)`;
+          this.description = `${change.type}${attrLabel} (showing original)`;
         } else {
-          this.description = change.type;
+          this.description = `${change.type}${attrLabel}`;
         }
       }
       
@@ -67,7 +72,13 @@ export class GuardTreeItem extends vscode.TreeItem {
     const md = new vscode.MarkdownString();
     md.isTrusted = true;
     md.appendMarkdown(`**${change.relativePath}**\n\n`);
-    md.appendMarkdown(`Type: \`${change.type}\`\n\n`);
+    md.appendMarkdown(`Type: \`${change.type}\`\n`);
+    if (change.attribution) {
+      const attrLabel = change.attribution === 'ai' ? 'AI' : change.attribution === 'human' ? 'Human' : 'Git / External';
+      md.appendMarkdown(`Attribution: \`${attrLabel}\`\n\n`);
+    } else {
+      md.appendMarkdown(`\n`);
+    }
     md.appendMarkdown(`Click to view diff • Use inline buttons to Accept ✓, Reject ✗, or Toggle 👁`);
     return md;
   }
