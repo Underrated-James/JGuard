@@ -5,6 +5,9 @@ var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
 var __getOwnPropNames = Object.getOwnPropertyNames;
 var __getProtoOf = Object.getPrototypeOf;
 var __hasOwnProp = Object.prototype.hasOwnProperty;
+var __commonJS = (cb, mod) => function __require() {
+  return mod || (0, cb[__getOwnPropNames(cb)[0]])((mod = { exports: {} }).exports, mod), mod.exports;
+};
 var __export = (target, all) => {
   for (var name in all)
     __defProp(target, name, { get: all[name], enumerable: true });
@@ -27,6 +30,464 @@ var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__ge
 ));
 var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: true }), mod);
 
+// node_modules/ignore/index.js
+var require_ignore = __commonJS({
+  "node_modules/ignore/index.js"(exports2, module2) {
+    function makeArray(subject) {
+      return Array.isArray(subject) ? subject : [subject];
+    }
+    var UNDEFINED = void 0;
+    var EMPTY = "";
+    var SPACE = " ";
+    var ESCAPE = "\\";
+    var REGEX_TEST_BLANK_LINE = /^\s+$/;
+    var REGEX_INVALID_TRAILING_BACKSLASH = /(?:[^\\]|^)\\$/;
+    var REGEX_REPLACE_LEADING_EXCAPED_EXCLAMATION = /^\\!/;
+    var REGEX_REPLACE_LEADING_EXCAPED_HASH = /^\\#/;
+    var REGEX_SPLITALL_CRLF = /\r?\n/g;
+    var REGEX_TEST_INVALID_PATH = /^\.{0,2}\/|^\.{1,2}$/;
+    var REGEX_TEST_TRAILING_SLASH = /\/$/;
+    var SLASH = "/";
+    var TMP_KEY_IGNORE = "node-ignore";
+    if (typeof Symbol !== "undefined") {
+      TMP_KEY_IGNORE = Symbol.for("node-ignore");
+    }
+    var KEY_IGNORE = TMP_KEY_IGNORE;
+    var define = (object, key, value) => {
+      Object.defineProperty(object, key, { value });
+      return value;
+    };
+    var REGEX_REGEXP_RANGE = /([0-z])-([0-z])/g;
+    var RETURN_FALSE = () => false;
+    var sanitizeRange = (range) => range.replace(
+      REGEX_REGEXP_RANGE,
+      (match, from, to) => from.charCodeAt(0) <= to.charCodeAt(0) ? match : EMPTY
+    );
+    var negateRange = (range) => range.startsWith("!") || range.startsWith("\\^") ? `^${range.slice(range[0] === "!" ? 1 : 2)}` : range;
+    var cleanRangeBackSlash = (slashes) => {
+      const { length } = slashes;
+      return slashes.slice(0, length - length % 2);
+    };
+    var REPLACERS = [
+      [
+        // Remove BOM
+        // TODO:
+        // Other similar zero-width characters?
+        /^\uFEFF/,
+        () => EMPTY
+      ],
+      // > Trailing spaces are ignored unless they are quoted with backslash ("\")
+      [
+        // (a\ ) -> (a )
+        // (a  ) -> (a)
+        // (a ) -> (a)
+        // (a \ ) -> (a  )
+        /((?:\\\\)*?)(\\?\s+)$/,
+        (_, m1, m2) => m1 + (m2.indexOf("\\") === 0 ? SPACE : EMPTY)
+      ],
+      // Replace (\ ) with ' '
+      // (\ ) -> ' '
+      // (\\ ) -> '\\ '
+      // (\\\ ) -> '\\ '
+      [
+        /(\\+?)\s/g,
+        (_, m1) => {
+          const { length } = m1;
+          return m1.slice(0, length - length % 2) + SPACE;
+        }
+      ],
+      // Escape metacharacters
+      // which is written down by users but means special for regular expressions.
+      // > There are 12 characters with special meanings:
+      // > - the backslash \,
+      // > - the caret ^,
+      // > - the dollar sign $,
+      // > - the period or dot .,
+      // > - the vertical bar or pipe symbol |,
+      // > - the question mark ?,
+      // > - the asterisk or star *,
+      // > - the plus sign +,
+      // > - the opening parenthesis (,
+      // > - the closing parenthesis ),
+      // > - and the opening square bracket [,
+      // > - the opening curly brace {,
+      // > These special characters are often called "metacharacters".
+      [
+        /[\\$.|*+(){^]/g,
+        (match) => `\\${match}`
+      ],
+      [
+        // > a question mark (?) matches a single character
+        /(?!\\)\?/g,
+        () => "[^/]"
+      ],
+      // leading slash
+      [
+        // > A leading slash matches the beginning of the pathname.
+        // > For example, "/*.c" matches "cat-file.c" but not "mozilla-sha1/sha1.c".
+        // A leading slash matches the beginning of the pathname
+        /^\//,
+        () => "^"
+      ],
+      // replace special metacharacter slash after the leading slash
+      [
+        /\//g,
+        () => "\\/"
+      ],
+      [
+        // > A leading "**" followed by a slash means match in all directories.
+        // > For example, "**/foo" matches file or directory "foo" anywhere,
+        // > the same as pattern "foo".
+        // > "**/foo/bar" matches file or directory "bar" anywhere that is directly
+        // >   under directory "foo".
+        // Notice that the '*'s have been replaced as '\\*'
+        /^\^*(?:\\\*\\\*\\\/)+/,
+        // '**/foo' <-> 'foo'
+        () => "^(?:.*\\/)?"
+      ],
+      // starting
+      [
+        // there will be no leading '/'
+        //   (which has been replaced by section "leading slash")
+        // If starts with '**', adding a '^' to the regular expression also works
+        /^(?=[^^])/,
+        function startingReplacer() {
+          return !/\/(?!$)/.test(this) ? "(?:^|\\/)" : "^";
+        }
+      ],
+      // two globstars
+      [
+        // Use lookahead assertions so that we could match more than one `'/**'`
+        /\\\/\\\*\\\*(?=\\\/|$)/g,
+        // Zero, one or several directories
+        // should not use '*', or it will be replaced by the next replacer
+        // Check if it is not the last `'/**'`
+        (_, index, str) => index + 6 < str.length ? "(?:\\/[^\\/]+)*" : "\\/.+"
+      ],
+      // normal intermediate wildcards
+      [
+        // Never replace escaped '*'
+        // ignore rule '\*' will match the path '*'
+        // 'abc.*/' -> go
+        // 'abc.*'  -> skip this rule,
+        //    coz trailing single wildcard will be handed by [trailing wildcard]
+        /(^|[^\\]+)(\\\*)+(?=.+)/g,
+        // '*.js' matches '.js'
+        // '*.js' doesn't match 'abc'
+        (_, p1, p2) => {
+          const unescaped = p2.replace(/\\\*/g, "[^\\/]*");
+          return p1 + unescaped;
+        }
+      ],
+      [
+        // unescape, revert step 3 except for back slash
+        // For example, if a user escape a '\\*',
+        // after step 3, the result will be '\\\\\\*'
+        /\\\\\\(?=[$.|*+(){^])/g,
+        () => ESCAPE
+      ],
+      [
+        // '\\\\' -> '\\'
+        /\\\\/g,
+        () => ESCAPE
+      ],
+      [
+        // > The range notation, e.g. [a-zA-Z],
+        // > can be used to match one of the characters in a range.
+        // `\` is escaped by step 3
+        /(\\)?\[([^\]/]*?)(\\*)($|\])/g,
+        (match, leadEscape, range, endEscape, close) => leadEscape === ESCAPE ? `\\[${range}${cleanRangeBackSlash(endEscape)}${close}` : close === "]" ? endEscape.length % 2 === 0 ? `[${negateRange(sanitizeRange(range))}${endEscape}]` : "[]" : "[]"
+      ],
+      // ending
+      [
+        // 'js' will not match 'js.'
+        // 'ab' will not match 'abc'
+        /(?:[^*])$/,
+        // WTF!
+        // https://git-scm.com/docs/gitignore
+        // changes in [2.22.1](https://git-scm.com/docs/gitignore/2.22.1)
+        // which re-fixes #24, #38
+        // > If there is a separator at the end of the pattern then the pattern
+        // > will only match directories, otherwise the pattern can match both
+        // > files and directories.
+        // 'js*' will not match 'a.js'
+        // 'js/' will not match 'a.js'
+        // 'js' will match 'a.js' and 'a.js/'
+        (match) => /\/$/.test(match) ? `${match}$` : `${match}(?=$|\\/$)`
+      ]
+    ];
+    var REGEX_REPLACE_TRAILING_WILDCARD = /(^|\\\/)?\\\*$/;
+    var MODE_IGNORE = "regex";
+    var MODE_CHECK_IGNORE = "checkRegex";
+    var UNDERSCORE = "_";
+    var TRAILING_WILD_CARD_REPLACERS = {
+      [MODE_IGNORE](_, p1) {
+        const prefix = p1 ? `${p1}[^/]+` : "[^/]*";
+        return `${prefix}(?=$|\\/$)`;
+      },
+      [MODE_CHECK_IGNORE](_, p1) {
+        const prefix = p1 ? `${p1}[^/]*` : "[^/]*";
+        return `${prefix}(?=$|\\/$)`;
+      }
+    };
+    var makeRegexPrefix = (pattern) => REPLACERS.reduce(
+      (prev, [matcher, replacer]) => prev.replace(matcher, replacer.bind(pattern)),
+      pattern
+    );
+    var isString = (subject) => typeof subject === "string";
+    var checkPattern = (pattern) => pattern && isString(pattern) && !REGEX_TEST_BLANK_LINE.test(pattern) && !REGEX_INVALID_TRAILING_BACKSLASH.test(pattern) && pattern.indexOf("#") !== 0;
+    var splitPattern = (pattern) => pattern.split(REGEX_SPLITALL_CRLF).filter(Boolean);
+    var IgnoreRule = class {
+      constructor(pattern, mark, body, ignoreCase, negative, prefix) {
+        this.pattern = pattern;
+        this.mark = mark;
+        this.negative = negative;
+        define(this, "body", body);
+        define(this, "ignoreCase", ignoreCase);
+        define(this, "regexPrefix", prefix);
+      }
+      get regex() {
+        const key = UNDERSCORE + MODE_IGNORE;
+        if (this[key]) {
+          return this[key];
+        }
+        return this._make(MODE_IGNORE, key);
+      }
+      get checkRegex() {
+        const key = UNDERSCORE + MODE_CHECK_IGNORE;
+        if (this[key]) {
+          return this[key];
+        }
+        return this._make(MODE_CHECK_IGNORE, key);
+      }
+      _make(mode, key) {
+        const str = this.regexPrefix.replace(
+          REGEX_REPLACE_TRAILING_WILDCARD,
+          // It does not need to bind pattern
+          TRAILING_WILD_CARD_REPLACERS[mode]
+        );
+        const regex = this.ignoreCase ? new RegExp(str, "i") : new RegExp(str);
+        return define(this, key, regex);
+      }
+    };
+    var createRule = ({
+      pattern,
+      mark
+    }, ignoreCase) => {
+      let negative = false;
+      let body = pattern;
+      if (body.indexOf("!") === 0) {
+        negative = true;
+        body = body.substr(1);
+      }
+      body = body.replace(REGEX_REPLACE_LEADING_EXCAPED_EXCLAMATION, "!").replace(REGEX_REPLACE_LEADING_EXCAPED_HASH, "#");
+      const regexPrefix = makeRegexPrefix(body);
+      return new IgnoreRule(
+        pattern,
+        mark,
+        body,
+        ignoreCase,
+        negative,
+        regexPrefix
+      );
+    };
+    var RuleManager = class {
+      constructor(ignoreCase) {
+        this._ignoreCase = ignoreCase;
+        this._rules = [];
+      }
+      _add(pattern) {
+        if (pattern && pattern[KEY_IGNORE]) {
+          this._rules = this._rules.concat(pattern._rules._rules);
+          this._added = true;
+          return;
+        }
+        if (isString(pattern)) {
+          pattern = {
+            pattern
+          };
+        }
+        if (checkPattern(pattern.pattern)) {
+          const rule = createRule(pattern, this._ignoreCase);
+          this._added = true;
+          this._rules.push(rule);
+        }
+      }
+      // @param {Array<string> | string | Ignore} pattern
+      add(pattern) {
+        this._added = false;
+        makeArray(
+          isString(pattern) ? splitPattern(pattern) : pattern
+        ).forEach(this._add, this);
+        return this._added;
+      }
+      // Test one single path without recursively checking parent directories
+      //
+      // - checkUnignored `boolean` whether should check if the path is unignored,
+      //   setting `checkUnignored` to `false` could reduce additional
+      //   path matching.
+      // - check `string` either `MODE_IGNORE` or `MODE_CHECK_IGNORE`
+      // @returns {TestResult} true if a file is ignored
+      test(path19, checkUnignored, mode) {
+        let ignored = false;
+        let unignored = false;
+        let matchedRule;
+        this._rules.forEach((rule) => {
+          const { negative } = rule;
+          if (unignored === negative && ignored !== unignored || negative && !ignored && !unignored && !checkUnignored) {
+            return;
+          }
+          const matched = rule[mode].test(path19);
+          if (!matched) {
+            return;
+          }
+          ignored = !negative;
+          unignored = negative;
+          matchedRule = negative ? UNDEFINED : rule;
+        });
+        const ret = {
+          ignored,
+          unignored
+        };
+        if (matchedRule) {
+          ret.rule = matchedRule;
+        }
+        return ret;
+      }
+    };
+    var throwError = (message, Ctor) => {
+      throw new Ctor(message);
+    };
+    var checkPath = (path19, originalPath, doThrow) => {
+      if (!isString(path19)) {
+        return doThrow(
+          `path must be a string, but got \`${originalPath}\``,
+          TypeError
+        );
+      }
+      if (!path19) {
+        return doThrow(`path must not be empty`, TypeError);
+      }
+      if (checkPath.isNotRelative(path19)) {
+        const r = "`path.relative()`d";
+        return doThrow(
+          `path should be a ${r} string, but got "${originalPath}"`,
+          RangeError
+        );
+      }
+      return true;
+    };
+    var isNotRelative = (path19) => REGEX_TEST_INVALID_PATH.test(path19);
+    checkPath.isNotRelative = isNotRelative;
+    checkPath.convert = (p) => p;
+    var Ignore2 = class {
+      constructor({
+        ignorecase = true,
+        ignoreCase = ignorecase,
+        allowRelativePaths = false
+      } = {}) {
+        define(this, KEY_IGNORE, true);
+        this._rules = new RuleManager(ignoreCase);
+        this._strictPathCheck = !allowRelativePaths;
+        this._initCache();
+      }
+      _initCache() {
+        this._ignoreCache = /* @__PURE__ */ Object.create(null);
+        this._testCache = /* @__PURE__ */ Object.create(null);
+      }
+      add(pattern) {
+        if (this._rules.add(pattern)) {
+          this._initCache();
+        }
+        return this;
+      }
+      // legacy
+      addPattern(pattern) {
+        return this.add(pattern);
+      }
+      // @returns {TestResult}
+      _test(originalPath, cache, checkUnignored, slices) {
+        const path19 = originalPath && checkPath.convert(originalPath);
+        checkPath(
+          path19,
+          originalPath,
+          this._strictPathCheck ? throwError : RETURN_FALSE
+        );
+        return this._t(path19, cache, checkUnignored, slices);
+      }
+      checkIgnore(path19) {
+        if (!REGEX_TEST_TRAILING_SLASH.test(path19)) {
+          return this.test(path19);
+        }
+        const slices = path19.split(SLASH).filter(Boolean);
+        slices.pop();
+        if (slices.length) {
+          const parent = this._t(
+            slices.join(SLASH) + SLASH,
+            this._testCache,
+            true,
+            slices
+          );
+          if (parent.ignored) {
+            return parent;
+          }
+        }
+        return this._rules.test(path19, false, MODE_CHECK_IGNORE);
+      }
+      _t(path19, cache, checkUnignored, slices) {
+        if (path19 in cache) {
+          return cache[path19];
+        }
+        if (!slices) {
+          slices = path19.split(SLASH).filter(Boolean);
+        }
+        slices.pop();
+        if (!slices.length) {
+          return cache[path19] = this._rules.test(path19, checkUnignored, MODE_IGNORE);
+        }
+        const parent = this._t(
+          slices.join(SLASH) + SLASH,
+          cache,
+          checkUnignored,
+          slices
+        );
+        return cache[path19] = parent.ignored ? parent : this._rules.test(path19, checkUnignored, MODE_IGNORE);
+      }
+      ignores(path19) {
+        return this._test(path19, this._ignoreCache, false).ignored;
+      }
+      createFilter() {
+        return (path19) => !this.ignores(path19);
+      }
+      filter(paths) {
+        return makeArray(paths).filter(this.createFilter());
+      }
+      // @returns {TestResult}
+      test(path19) {
+        return this._test(path19, this._testCache, true);
+      }
+    };
+    var factory = (options) => new Ignore2(options);
+    var isPathValid = (path19) => checkPath(path19 && checkPath.convert(path19), path19, RETURN_FALSE);
+    var setupWindows = () => {
+      const makePosix = (str) => /^\\\\\?\\/.test(str) || /["<>|\u0000-\u001F]+/u.test(str) ? str : str.replace(/\\/g, "/");
+      checkPath.convert = makePosix;
+      const REGEX_TEST_WINDOWS_PATH_ABSOLUTE = /^[a-z]:\//i;
+      checkPath.isNotRelative = (path19) => REGEX_TEST_WINDOWS_PATH_ABSOLUTE.test(path19) || isNotRelative(path19);
+    };
+    if (
+      // Detect `process` so that it can run in browsers.
+      typeof process !== "undefined" && process.platform === "win32"
+    ) {
+      setupWindows();
+    }
+    module2.exports = factory;
+    factory.default = factory;
+    module2.exports.isPathValid = isPathValid;
+    define(module2.exports, Symbol.for("setupWindows"), setupWindows);
+  }
+});
+
 // src/extension.ts
 var extension_exports = {};
 __export(extension_exports, {
@@ -34,7 +495,7 @@ __export(extension_exports, {
   deactivate: () => deactivate
 });
 module.exports = __toCommonJS(extension_exports);
-var vscode10 = __toESM(require("vscode"));
+var vscode11 = __toESM(require("vscode"));
 
 // src/storage/MetadataStore.ts
 var fs = __toESM(require("fs/promises"));
@@ -299,7 +760,7 @@ var ObjectStore = class {
     } catch {
     }
     await fs3.mkdir(objDir, { recursive: true });
-    const tmpPath = `${objPath}.tmp.${Date.now()}`;
+    const tmpPath = `${objPath}.tmp.${Date.now()}.${Math.random().toString(36).substring(2)}`;
     await fs3.writeFile(tmpPath, finalContent);
     await fs3.rename(tmpPath, objPath);
     return hash;
@@ -647,6 +1108,58 @@ var CheckpointService = class {
       console.error("GC error", e);
     }
   }
+  /**
+   * Manually clears old finalized sessions from history, keeping only the 3 most recent ones.
+   */
+  async clearOldHistory(keepCount = 3) {
+    const checkpointsDir = this.metadataStore.getCheckpointsDir();
+    try {
+      const dirFiles = await fs5.readdir(checkpointsDir);
+      const cpFiles = dirFiles.filter((f) => f.endsWith(".json"));
+      const checkpoints = [];
+      for (const f of cpFiles) {
+        const id = f.replace(".json", "");
+        const cp = await this.metadataStore.read(id);
+        checkpoints.push({ id, createdAt: cp.createdAt, status: cp.status });
+      }
+      checkpoints.sort((a, b) => b.createdAt - a.createdAt);
+      const finalized = checkpoints.filter((cp) => cp.status !== "active");
+      let deletedCount = 0;
+      for (let i = keepCount; i < finalized.length; i++) {
+        await this.metadataStore.delete(finalized[i].id);
+        await this.metadataStore.deleteSession(finalized[i].id);
+        deletedCount++;
+      }
+      if (this.gcEnabled && deletedCount > 0) {
+        const storageBaseDir = this.metadataStore.storageBaseDir;
+        const gc = new BlobGarbageCollector(this.metadataStore, this.objectStore, storageBaseDir);
+        const gcResult = await gc.run();
+        console.log(`JGuard Manual GC: Deleted ${gcResult.deletedCount} orphaned blobs, freed ${(gcResult.bytesFreed / 1024 / 1024).toFixed(2)} MB`);
+      }
+    } catch (e) {
+      console.error("Failed to clear history", e);
+      throw e;
+    }
+  }
+  /**
+   * Deletes a specific finalized session from history.
+   */
+  async deleteHistorySession(sessionId) {
+    try {
+      const cp = await this.metadataStore.readSession(sessionId);
+      await this.metadataStore.delete(sessionId);
+      await this.metadataStore.deleteSession(sessionId);
+      if (this.gcEnabled) {
+        const storageBaseDir = this.metadataStore.storageBaseDir;
+        const gc = new BlobGarbageCollector(this.metadataStore, this.objectStore, storageBaseDir);
+        const gcResult = await gc.run();
+        console.log(`JGuard: Deleted specific session ${sessionId}. GC freed ${(gcResult.bytesFreed / 1024 / 1024).toFixed(2)} MB`);
+      }
+    } catch (e) {
+      console.error(`Failed to delete session ${sessionId}`, e);
+      throw e;
+    }
+  }
 };
 
 // src/application/RestoreService.ts
@@ -671,16 +1184,16 @@ var RestoreService = class {
           throw new Error(`Hash mismatch during restore of ${op.relativePath}`);
         }
         try {
-          const vscode11 = require("vscode");
-          await vscode11.workspace.fs.writeFile(vscode11.Uri.file(op.absolutePath), content);
+          const vscode12 = require("vscode");
+          await vscode12.workspace.fs.writeFile(vscode12.Uri.file(op.absolutePath), content);
         } catch (e) {
           await fs6.writeFile(op.absolutePath, content);
         }
       } else if (op.type === "delete") {
         try {
           try {
-            const vscode11 = require("vscode");
-            await vscode11.workspace.fs.delete(vscode11.Uri.file(op.absolutePath), { useTrash: false });
+            const vscode12 = require("vscode");
+            await vscode12.workspace.fs.delete(vscode12.Uri.file(op.absolutePath), { useTrash: false });
           } catch (e) {
             await fs6.unlink(op.absolutePath);
           }
@@ -698,7 +1211,8 @@ var RestoreService = class {
 var vscode = __toESM(require("vscode"));
 var fs7 = __toESM(require("fs/promises"));
 var WorkspaceScanner = class {
-  constructor(excludePatterns = ["**/node_modules/**", "**/.git/**", "**/dist/**"]) {
+  constructor(ignoreManager, excludePatterns = ["**/node_modules/**", "**/.git/**", "**/dist/**", "**/build/**", "**/.angular/**", "**/target/**"]) {
+    this.ignoreManager = ignoreManager;
     this.excludePatterns = excludePatterns;
   }
   /**
@@ -719,6 +1233,8 @@ var WorkspaceScanner = class {
       this.warnIfLarge(uris.length);
       for (const uri of uris) {
         if (uri.scheme === "file") {
+          if (this.ignoreManager.isIgnored(uri.fsPath))
+            continue;
           const stat5 = await fs7.stat(uri.fsPath);
           const relativePath = vscode.workspace.asRelativePath(uri, false);
           map.set(relativePath, {
@@ -739,6 +1255,8 @@ var WorkspaceScanner = class {
         const uris = await vscode.workspace.findFiles(pattern, excludeGlob);
         for (const uri of uris) {
           if (uri.scheme === "file") {
+            if (this.ignoreManager.isIgnored(uri.fsPath))
+              continue;
             const stat5 = await fs7.stat(uri.fsPath);
             const folderRelPath = vscode.workspace.asRelativePath(uri, isMultiRoot);
             map.set(folderRelPath, {
@@ -1401,7 +1919,7 @@ var BranchWatcher = class {
 
 // src/vscode/Commands.ts
 var Commands = class {
-  constructor(context, checkpointService, restoreService, scanner, sidebar, statusBar2, objectStore) {
+  constructor(context, checkpointService, restoreService, scanner, sidebar, statusBar2, objectStore, ignoreManager) {
     this.context = context;
     this.checkpointService = checkpointService;
     this.restoreService = restoreService;
@@ -1409,6 +1927,7 @@ var Commands = class {
     this.sidebar = sidebar;
     this.statusBar = statusBar2;
     this.objectStore = objectStore;
+    this.ignoreManager = ignoreManager;
     this.branchWatcher = new BranchWatcher();
     this.context.subscriptions.push(this.branchWatcher);
     this.context.subscriptions.push(
@@ -1439,6 +1958,9 @@ var Commands = class {
   viewState = "ai";
   _onDidFinalizeSession = new vscode6.EventEmitter();
   onDidFinalizeSession = this._onDidFinalizeSession.event;
+  getActiveSessionId() {
+    return this.activeSession?.id;
+  }
   branchWatcher;
   register() {
     this.context.subscriptions.push(
@@ -1462,6 +1984,8 @@ var Commands = class {
       }
     });
     const onDidChange = (uri) => {
+      if (this.ignoreManager.isIgnored(uri.fsPath))
+        return;
       watcherQueue.enqueue(uri);
     };
     this.context.subscriptions.push(
@@ -1548,6 +2072,42 @@ var Commands = class {
           changeSet.decisions[change.relativePath] = savedDecisions[change.relativePath];
         }
       }
+      if (existingCs) {
+        for (const change of existingCs.changes) {
+          if (!changeSet.changes.find((c) => c.relativePath === change.relativePath)) {
+            const viewState = this.fileViewStates.get(change.relativePath);
+            const decision = existingCs.decisions[change.relativePath];
+            if (viewState === "original" || decision === "rejected") {
+              changeSet.changes.push(change);
+              if (existingCs.aiStateHashes[change.relativePath]) {
+                changeSet.aiStateHashes[change.relativePath] = existingCs.aiStateHashes[change.relativePath];
+              }
+              changeSet.decisions[change.relativePath] = decision;
+            }
+          }
+        }
+      } else if (savedDecisions && this.activeSession.uiState?.aiSnapshotHashes) {
+        for (const [relPath, decision] of Object.entries(savedDecisions)) {
+          const viewState = this.fileViewStates.get(relPath);
+          if (viewState === "original" || decision === "rejected") {
+            if (!changeSet.changes.find((c) => c.relativePath === relPath)) {
+              const snapshot = checkpoint.files[relPath];
+              const aiHash = this.activeSession.uiState.aiSnapshotHashes[relPath];
+              const changeType = snapshot ? aiHash ? "modified" : "deleted" : "created";
+              changeSet.changes.push({
+                type: changeType,
+                relativePath: relPath,
+                checkpointHash: snapshot?.hash,
+                currentHash: aiHash
+              });
+              if (aiHash) {
+                changeSet.aiStateHashes[relPath] = aiHash;
+              }
+              changeSet.decisions[relPath] = decision;
+            }
+          }
+        }
+      }
       this.changeSets.set(wsRoot, changeSet);
       totalCount += changeSet.changes.length;
     }
@@ -1586,6 +2146,19 @@ var Commands = class {
       const existingCs = this.changeSets.get(wsRoot);
       if (checkpoint && existingCs) {
         const newChangeSet = await ChangeDetector.detectDelta(checkpoint, wsRoot, dirtyPaths, existingCs);
+        for (const change of existingCs.changes) {
+          if (!newChangeSet.changes.find((c) => c.relativePath === change.relativePath)) {
+            const viewState = this.fileViewStates.get(change.relativePath);
+            const decision = existingCs.decisions[change.relativePath];
+            if (viewState === "original" || decision === "rejected") {
+              newChangeSet.changes.push(change);
+              if (existingCs.aiStateHashes[change.relativePath]) {
+                newChangeSet.aiStateHashes[change.relativePath] = existingCs.aiStateHashes[change.relativePath];
+              }
+              newChangeSet.decisions[change.relativePath] = decision;
+            }
+          }
+        }
         this.changeSets.set(wsRoot, newChangeSet);
       } else if (checkpoint && !existingCs) {
         const changeSet = await ChangeDetector.detectChanges(checkpoint, this.scanner, wsRoot);
@@ -2242,6 +2815,7 @@ var CheckpointDetailWebview = class _CheckpointDetailWebview {
     let totalFiles = 0;
     let accepted = 0;
     let rejected = 0;
+    let pending = 0;
     for (const cp of Object.values(session.folderCheckpoints)) {
       totalFiles += Object.keys(cp.files).length;
     }
@@ -2250,8 +2824,10 @@ var CheckpointDetailWebview = class _CheckpointDetailWebview {
         for (const decision of Object.values(rootDecisions)) {
           if (decision === "accepted")
             accepted++;
-          if (decision === "rejected")
+          else if (decision === "rejected")
             rejected++;
+          else if (decision === "pending")
+            pending++;
         }
       }
     }
@@ -2357,6 +2933,10 @@ var CheckpointDetailWebview = class _CheckpointDetailWebview {
                 color: var(--vscode-testing-iconFailed); 
                 background-color: rgba(241, 76, 76, 0.15);
               }
+              .badge-pending { 
+                color: var(--vscode-testing-iconQueued); 
+                background-color: rgba(204, 204, 204, 0.15);
+              }
               .diff-btn {
                 font-size: 12px;
                 color: var(--vscode-textLink-foreground);
@@ -2406,6 +2986,10 @@ var CheckpointDetailWebview = class _CheckpointDetailWebview {
                   <div class="stat-value" style="color: var(--vscode-testing-iconFailed);">${rejected}</div>
                   <div class="stat-label">Rejected Changes</div>
               </div>
+              <div class="stat-box">
+                  <div class="stat-value" style="color: var(--vscode-testing-iconQueued);">${pending}</div>
+                  <div class="stat-label">Pending Changes</div>
+              </div>
           </div>
           
           <div class="decisions-section">
@@ -2441,9 +3025,18 @@ var CheckpointDetailWebview = class _CheckpointDetailWebview {
     for (const [wsRoot, rootDecisions] of Object.entries(session.uiState.decisions)) {
       const checkpoint = session.folderCheckpoints[wsRoot];
       for (const [filePath, decision] of Object.entries(rootDecisions)) {
-        const isAccepted = decision === "accepted";
-        const badgeClass = isAccepted ? "badge-accept" : "badge-reject";
-        const icon = isAccepted ? "\u2713" : "\u2717";
+        let badgeClass = "";
+        let icon = "";
+        if (decision === "accepted") {
+          badgeClass = "badge-accept";
+          icon = "\u2713";
+        } else if (decision === "rejected") {
+          badgeClass = "badge-reject";
+          icon = "\u2717";
+        } else {
+          badgeClass = "badge-pending";
+          icon = "\u25CB";
+        }
         const origHash = checkpoint?.files[filePath]?.hash || "";
         const aiHash = session.uiState?.aiSnapshotHashes?.[filePath] || "";
         html += `
@@ -2566,16 +3159,16 @@ var Diff = class {
       }
     }
   }
-  addToPath(path16, added, removed, oldPosInc, options) {
-    const last = path16.lastComponent;
+  addToPath(path19, added, removed, oldPosInc, options) {
+    const last = path19.lastComponent;
     if (last && !options.oneChangePerToken && last.added === added && last.removed === removed) {
       return {
-        oldPos: path16.oldPos + oldPosInc,
+        oldPos: path19.oldPos + oldPosInc,
         lastComponent: { count: last.count + 1, added, removed, previousComponent: last.previousComponent }
       };
     } else {
       return {
-        oldPos: path16.oldPos + oldPosInc,
+        oldPos: path19.oldPos + oldPosInc,
         lastComponent: { count: 1, added, removed, previousComponent: last }
       };
     }
@@ -3394,9 +3987,232 @@ var JGuardCodeLensProvider = class {
   }
 };
 
-// src/extension.ts
-var path15 = __toESM(require("path"));
+// src/storage/StashStore.ts
 var fs10 = __toESM(require("fs/promises"));
+var path15 = __toESM(require("path"));
+var StashStore = class {
+  constructor(storageBaseDir) {
+    this.storageBaseDir = storageBaseDir;
+  }
+  getStashesPath() {
+    return path15.join(this.storageBaseDir, "stashes.json");
+  }
+  async initialize() {
+    const p = this.getStashesPath();
+    try {
+      await fs10.access(p);
+    } catch {
+      await fs10.writeFile(p, "[]", "utf-8");
+    }
+  }
+  async getStashes() {
+    try {
+      const content = await fs10.readFile(this.getStashesPath(), "utf-8");
+      return JSON.parse(content);
+    } catch {
+      return [];
+    }
+  }
+  async saveStash(stash) {
+    const stashes = await this.getStashes();
+    stashes.push(stash);
+    await fs10.writeFile(this.getStashesPath(), JSON.stringify(stashes, null, 2), "utf-8");
+  }
+  async removeStash(id) {
+    const stashes = await this.getStashes();
+    const updated = stashes.filter((s) => s.id !== id);
+    await fs10.writeFile(this.getStashesPath(), JSON.stringify(updated, null, 2), "utf-8");
+  }
+  async getStash(id) {
+    const stashes = await this.getStashes();
+    return stashes.find((s) => s.id === id);
+  }
+};
+
+// src/application/StashService.ts
+var path16 = __toESM(require("path"));
+var StashService = class {
+  constructor(stashStore, objectStore, restoreService) {
+    this.stashStore = stashStore;
+    this.objectStore = objectStore;
+    this.restoreService = restoreService;
+  }
+  /**
+   * Stashes the current file content (AI) and restores the original file content.
+   */
+  async stashChange(wsRoot, relativePath, originalHash, stashedHash) {
+    if (!stashedHash && !originalHash) {
+      throw new Error("Cannot stash a file with no changes.");
+    }
+    const id = `stash_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+    const stash = {
+      id,
+      timestamp: Date.now(),
+      relativePath,
+      originalHash,
+      stashedHash,
+      workspaceRoot: wsRoot
+    };
+    await this.stashStore.saveStash(stash);
+    const absolutePath = path16.join(wsRoot, relativePath);
+    const plan = {
+      operations: [
+        originalHash ? { type: "write", relativePath, absolutePath, objectHash: originalHash } : { type: "delete", relativePath, absolutePath, objectHash: null }
+      ]
+    };
+    await this.restoreService.execute(plan);
+  }
+  /**
+   * Restores the stashed hash (AI) back into the physical file, removing the stash.
+   */
+  async popStash(stashId) {
+    await this.applyStash(stashId);
+    await this.stashStore.removeStash(stashId);
+  }
+  /**
+   * Restores the stashed hash (AI) back into the physical file, keeping the stash.
+   */
+  async applyStash(stashId) {
+    const stash = await this.stashStore.getStash(stashId);
+    if (!stash) {
+      throw new Error("Stash not found.");
+    }
+    const absolutePath = path16.join(stash.workspaceRoot, stash.relativePath);
+    const plan = {
+      operations: [
+        stash.stashedHash ? { type: "write", relativePath: stash.relativePath, absolutePath, objectHash: stash.stashedHash } : { type: "delete", relativePath: stash.relativePath, absolutePath, objectHash: null }
+      ]
+    };
+    await this.restoreService.execute(plan);
+  }
+  /**
+   * Deletes the stash without applying it.
+   */
+  async dropStash(stashId) {
+    await this.stashStore.removeStash(stashId);
+  }
+  async getStashes() {
+    return this.stashStore.getStashes();
+  }
+};
+
+// src/vscode/StashTreeProvider.ts
+var vscode10 = __toESM(require("vscode"));
+var StashedChangeTreeItem = class extends vscode10.TreeItem {
+  constructor(stash) {
+    super(stash.relativePath, vscode10.TreeItemCollapsibleState.None);
+    this.stash = stash;
+    this.contextValue = "jguard.stashedChangeItem";
+    const date = new Date(stash.timestamp);
+    this.description = date.toLocaleTimeString();
+    this.tooltip = new vscode10.MarkdownString(
+      `**${stash.relativePath}**
+
+Stashed at: ${date.toLocaleString()}`
+    );
+    this.tooltip.isTrusted = true;
+    this.iconPath = new vscode10.ThemeIcon("archive");
+  }
+};
+var StashTreeProvider = class {
+  constructor(stashService) {
+    this.stashService = stashService;
+  }
+  _onDidChangeTreeData = new vscode10.EventEmitter();
+  onDidChangeTreeData = this._onDidChangeTreeData.event;
+  refresh() {
+    this._onDidChangeTreeData.fire();
+  }
+  getTreeItem(element) {
+    return element;
+  }
+  async getChildren(element) {
+    if (element) {
+      return [];
+    }
+    const stashes = await this.stashService.getStashes();
+    stashes.sort((a, b) => b.timestamp - a.timestamp);
+    return stashes.map((stash) => new StashedChangeTreeItem(stash));
+  }
+};
+
+// src/extension.ts
+var path18 = __toESM(require("path"));
+var fs12 = __toESM(require("fs/promises"));
+
+// src/core/IgnoreManager.ts
+var import_ignore = __toESM(require_ignore());
+var path17 = __toESM(require("path"));
+var fs11 = __toESM(require("fs/promises"));
+var IgnoreManager = class {
+  ig;
+  workspaceRoot;
+  constructor(workspaceRoot) {
+    this.workspaceRoot = workspaceRoot;
+    this.ig = (0, import_ignore.default)();
+    this.ig.add([
+      // JS / Node
+      "node_modules",
+      "dist",
+      "build",
+      "out",
+      ".angular",
+      ".next",
+      ".nuxt",
+      "coverage",
+      ".turbo",
+      // Java
+      "target",
+      ".gradle",
+      // Python
+      "__pycache__",
+      "venv",
+      ".venv",
+      "env",
+      ".pytest_cache",
+      ".tox",
+      // .NET
+      "bin",
+      "obj",
+      ".vs",
+      // System / General
+      ".git",
+      ".idea",
+      ".DS_Store"
+    ]);
+  }
+  /**
+   * Initializes the manager by reading the .gitignore file if it exists.
+   */
+  async initialize() {
+    const gitignorePath = path17.join(this.workspaceRoot, ".gitignore");
+    try {
+      const content = await fs11.readFile(gitignorePath, "utf8");
+      this.ig.add(content);
+      console.log("JGuard: Loaded .gitignore rules from", gitignorePath);
+    } catch (err) {
+      if (err.code !== "ENOENT") {
+        console.error("JGuard: Failed to read .gitignore", err);
+      }
+    }
+  }
+  /**
+   * Checks if an absolute file path should be ignored.
+   * @param absolutePath The absolute path of the file/folder to check.
+   */
+  isIgnored(absolutePath) {
+    if (!absolutePath.startsWith(this.workspaceRoot)) {
+      return false;
+    }
+    const relativePath = path17.relative(this.workspaceRoot, absolutePath).replace(/\\/g, "/");
+    if (relativePath === "") {
+      return false;
+    }
+    return this.ig.ignores(relativePath);
+  }
+};
+
+// src/extension.ts
 var statusBar;
 var commands4;
 async function activate(context) {
@@ -3404,40 +4220,143 @@ async function activate(context) {
   const storageBaseDir = context.globalStorageUri.fsPath;
   const metadataStore = new MetadataStore(storageBaseDir);
   const objectStore = new ObjectStore(storageBaseDir);
+  const stashStore = new StashStore(storageBaseDir);
   await metadataStore.initialize();
   await objectStore.initialize();
+  await stashStore.initialize();
   let wsRoot = "";
-  if (vscode10.workspace.workspaceFolders && vscode10.workspace.workspaceFolders.length > 0) {
-    wsRoot = vscode10.workspace.workspaceFolders[0].uri.fsPath;
+  if (vscode11.workspace.workspaceFolders && vscode11.workspace.workspaceFolders.length > 0) {
+    wsRoot = vscode11.workspace.workspaceFolders[0].uri.fsPath;
   }
-  const scanner = new WorkspaceScanner();
+  const ignoreManager = new IgnoreManager(wsRoot);
+  await ignoreManager.initialize();
+  const scanner = new WorkspaceScanner(ignoreManager);
   const checkpointService = new CheckpointService(metadataStore, objectStore, scanner, wsRoot);
   const restoreService = new RestoreService(objectStore);
-  const gcEnabled = vscode10.workspace.getConfiguration("jguard").get("enableGarbageCollection", true);
+  const stashService = new StashService(stashStore, objectStore, restoreService);
+  const gcEnabled = vscode11.workspace.getConfiguration("jguard").get("enableGarbageCollection", true);
   checkpointService.setGCEnabled(gcEnabled);
   context.subscriptions.push(
-    vscode10.workspace.onDidChangeConfiguration((e) => {
+    vscode11.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration("jguard.enableGarbageCollection")) {
-        const enabled = vscode10.workspace.getConfiguration("jguard").get("enableGarbageCollection", true);
+        const enabled = vscode11.workspace.getConfiguration("jguard").get("enableGarbageCollection", true);
         checkpointService.setGCEnabled(enabled);
       }
     })
   );
   statusBar = new StatusBar();
-  const sidebar = new SidebarProvider();
+  const sidebarProvider = new SidebarProvider();
   const historyProvider = new HistoryTreeProvider(metadataStore);
+  const stashProvider = new StashTreeProvider(stashService);
   const diffProvider = new DiffProvider(objectStore);
-  vscode10.window.registerTreeDataProvider("jguardSidebar", sidebar);
-  vscode10.window.registerTreeDataProvider("jguardHistory", historyProvider);
-  vscode10.workspace.registerTextDocumentContentProvider(DiffProvider.scheme, diffProvider);
-  commands4 = new Commands(context, checkpointService, restoreService, scanner, sidebar, statusBar, objectStore);
+  context.subscriptions.push(
+    vscode11.window.registerTreeDataProvider("jguardSidebar", sidebarProvider),
+    vscode11.window.registerTreeDataProvider("jguardHistory", historyProvider),
+    vscode11.window.registerTreeDataProvider("jguardStash", stashProvider)
+  );
+  vscode11.workspace.registerTextDocumentContentProvider(DiffProvider.scheme, diffProvider);
+  commands4 = new Commands(context, checkpointService, restoreService, scanner, sidebarProvider, statusBar, objectStore, ignoreManager);
   commands4.register();
   const codeLensProvider = new JGuardCodeLensProvider(commands4, objectStore);
-  vscode10.languages.registerCodeLensProvider({ scheme: "file" }, codeLensProvider);
+  vscode11.languages.registerCodeLensProvider({ scheme: "file" }, codeLensProvider);
   context.subscriptions.push(
-    vscode10.commands.registerCommand("jguard.showHistoryDetails", (item) => {
+    vscode11.commands.registerCommand("jguard.showHistoryDetails", (item) => {
       if (item && item.session) {
         CheckpointDetailWebview.show(context, item.session);
+      }
+    }),
+    vscode11.commands.registerCommand("jguard.clearHistory", async () => {
+      const choice = await vscode11.window.showWarningMessage(
+        "Are you sure you want to bulk clear old sessions? (This will keep your 3 most recent sessions)",
+        "Clear Old History",
+        "Cancel"
+      );
+      if (choice === "Clear Old History") {
+        try {
+          await checkpointService.clearOldHistory(3);
+          historyProvider.refresh();
+          vscode11.window.showInformationMessage("JGuard: Old session history cleared successfully.");
+        } catch (e) {
+          vscode11.window.showErrorMessage(`Failed to clear history: ${e.message}`);
+        }
+      }
+    }),
+    vscode11.commands.registerCommand("jguard.deleteHistorySession", async (item) => {
+      if (item && item.session) {
+        if (commands4.getActiveSessionId() === item.session.id) {
+          vscode11.window.showErrorMessage("You cannot delete the active session that you are currently protecting in your editor.");
+          return;
+        }
+        const choice = await vscode11.window.showWarningMessage(
+          "Are you sure you want to delete this specific session? This will permanently delete its checkpoint data.",
+          "Delete Session",
+          "Cancel"
+        );
+        if (choice === "Delete Session") {
+          try {
+            await checkpointService.deleteHistorySession(item.session.id);
+            historyProvider.refresh();
+            vscode11.window.showInformationMessage("JGuard: Session deleted successfully.");
+          } catch (e) {
+            vscode11.window.showErrorMessage(`Failed to delete session: ${e.message}`);
+          }
+        }
+      }
+    }),
+    vscode11.commands.registerCommand("jguard.refreshHistory", () => {
+      historyProvider.refresh();
+    }),
+    vscode11.commands.registerCommand("jguard.stashFile", async (item) => {
+      if (item && item.change) {
+        const change = item.change;
+        const activeId = commands4.getActiveSessionId();
+        if (!activeId)
+          return;
+        try {
+          await stashService.stashChange(
+            item.wsRoot || vscode11.workspace.workspaceFolders[0].uri.fsPath,
+            change.relativePath,
+            change.type === "created" ? null : change.checkpointHash,
+            change.type === "deleted" ? null : change.currentHash
+          );
+          vscode11.commands.executeCommand("jguard.refresh");
+          stashProvider.refresh();
+          vscode11.window.showInformationMessage(`JGuard: Stashed ${change.relativePath}`);
+        } catch (e) {
+          vscode11.window.showErrorMessage(`Failed to stash: ${e.message}`);
+        }
+      }
+    }),
+    vscode11.commands.registerCommand("jguard.popStash", async (item) => {
+      if (item && item.stash) {
+        try {
+          await stashService.popStash(item.stash.id);
+          stashProvider.refresh();
+          vscode11.window.showInformationMessage(`JGuard: Popped stash for ${item.stash.relativePath}`);
+        } catch (e) {
+          vscode11.window.showErrorMessage(`Failed to pop stash: ${e.message}`);
+        }
+      }
+    }),
+    vscode11.commands.registerCommand("jguard.applyStash", async (item) => {
+      if (item && item.stash) {
+        try {
+          await stashService.applyStash(item.stash.id);
+          vscode11.window.showInformationMessage(`JGuard: Applied stash for ${item.stash.relativePath}`);
+        } catch (e) {
+          vscode11.window.showErrorMessage(`Failed to apply stash: ${e.message}`);
+        }
+      }
+    }),
+    vscode11.commands.registerCommand("jguard.dropStash", async (item) => {
+      if (item && item.stash) {
+        try {
+          await stashService.dropStash(item.stash.id);
+          stashProvider.refresh();
+          vscode11.window.showInformationMessage(`JGuard: Dropped stash for ${item.stash.relativePath}`);
+        } catch (e) {
+          vscode11.window.showErrorMessage(`Failed to drop stash: ${e.message}`);
+        }
       }
     })
   );
@@ -3446,11 +4365,11 @@ async function activate(context) {
       historyProvider.refresh();
     })
   );
-  const lockFile = path15.join(storageBaseDir, "jguard.lock");
+  const lockFile = path18.join(storageBaseDir, "jguard.lock");
   try {
-    const activeId = await fs10.readFile(lockFile, "utf-8");
+    const activeId = await fs12.readFile(lockFile, "utf-8");
     if (activeId) {
-      vscode10.window.showWarningMessage(
+      vscode11.window.showWarningMessage(
         "AI Guard: Found an active checkpoint from a previous session. Do you want to resume protecting?",
         "Resume",
         "Discard"
@@ -3462,7 +4381,7 @@ async function activate(context) {
               session = await metadataStore.readSession(activeId.trim());
             } catch {
               const cp = await metadataStore.read(activeId.trim());
-              const wsRoot2 = cp.workspaceRoot || (vscode10.workspace.workspaceFolders?.[0]?.uri.fsPath || "");
+              const wsRoot2 = cp.workspaceRoot || (vscode11.workspace.workspaceFolders?.[0]?.uri.fsPath || "");
               session = {
                 id: activeId.trim(),
                 createdAt: cp.createdAt,
@@ -3474,12 +4393,12 @@ async function activate(context) {
             statusBar.setState("protecting");
             await commands4.refresh();
           } catch (e) {
-            vscode10.window.showErrorMessage("Failed to resume checkpoint. It may be corrupted.");
-            await fs10.unlink(lockFile).catch(() => {
+            vscode11.window.showErrorMessage("Failed to resume checkpoint. It may be corrupted.");
+            await fs12.unlink(lockFile).catch(() => {
             });
           }
         } else if (choice === "Discard") {
-          await fs10.unlink(lockFile).catch(() => {
+          await fs12.unlink(lockFile).catch(() => {
           });
         }
       });

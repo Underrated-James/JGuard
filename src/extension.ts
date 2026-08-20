@@ -11,8 +11,12 @@ import { Commands } from './vscode/Commands';
 import { HistoryTreeProvider, HistorySessionTreeItem } from './vscode/HistoryTreeProvider';
 import { CheckpointDetailWebview } from './vscode/CheckpointDetailWebview';
 import { JGuardCodeLensProvider } from './vscode/CodeLensProvider';
+import { StashStore } from './storage/StashStore';
+import { StashService } from './application/StashService';
+import { StashTreeProvider, StashedChangeTreeItem } from './vscode/StashTreeProvider';
 import * as path from 'path';
 import * as fs from 'fs/promises';
+import { IgnoreManager } from './core/IgnoreManager';
 
 let statusBar: StatusBar;
 let commands: Commands;
@@ -24,19 +28,25 @@ export async function activate(context: vscode.ExtensionContext) {
   const storageBaseDir = context.globalStorageUri.fsPath;
   const metadataStore = new MetadataStore(storageBaseDir);
   const objectStore = new ObjectStore(storageBaseDir);
+  const stashStore = new StashStore(storageBaseDir);
 
   await metadataStore.initialize();
   await objectStore.initialize();
+  await stashStore.initialize();
 
   let wsRoot = '';
   if (vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0) {
     wsRoot = vscode.workspace.workspaceFolders[0].uri.fsPath;
   }
   
+  const ignoreManager = new IgnoreManager(wsRoot);
+  await ignoreManager.initialize();
+
   // L1: CheckpointService handles multi-root, but still takes a fallback wsRoot
-  const scanner = new WorkspaceScanner();
+  const scanner = new WorkspaceScanner(ignoreManager);
   const checkpointService = new CheckpointService(metadataStore, objectStore, scanner, wsRoot);
   const restoreService = new RestoreService(objectStore);
+  const stashService = new StashService(stashStore, objectStore, restoreService);
 
   // Read GC config
   const gcEnabled = vscode.workspace.getConfiguration('jguard').get<boolean>('enableGarbageCollection', true);
@@ -54,17 +64,20 @@ export async function activate(context: vscode.ExtensionContext) {
 
   // UI Setup
   statusBar = new StatusBar();
-  const sidebar = new SidebarProvider();
+  const sidebarProvider = new SidebarProvider();
   const historyProvider = new HistoryTreeProvider(metadataStore);
+  const stashProvider = new StashTreeProvider(stashService);
   const diffProvider = new DiffProvider(objectStore);
 
-  // Register providers
-  vscode.window.registerTreeDataProvider('jguardSidebar', sidebar);
-  vscode.window.registerTreeDataProvider('jguardHistory', historyProvider);
+  context.subscriptions.push(
+    vscode.window.registerTreeDataProvider('jguardSidebar', sidebarProvider),
+    vscode.window.registerTreeDataProvider('jguardHistory', historyProvider),
+    vscode.window.registerTreeDataProvider('jguardStash', stashProvider)
+  );
   vscode.workspace.registerTextDocumentContentProvider(DiffProvider.scheme, diffProvider);
 
   // Register commands — L2/L6: now receives objectStore for per-file snapshots and binary diffs
-  commands = new Commands(context, checkpointService, restoreService, scanner, sidebar, statusBar, objectStore);
+  commands = new Commands(context, checkpointService, restoreService, scanner, sidebarProvider, statusBar, objectStore, ignoreManager);
   commands.register();
 
   // Register CodeLensProvider
@@ -76,6 +89,105 @@ export async function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('jguard.showHistoryDetails', (item: HistorySessionTreeItem) => {
       if (item && item.session) {
         CheckpointDetailWebview.show(context, item.session);
+      }
+    }),
+    vscode.commands.registerCommand('jguard.clearHistory', async () => {
+      const choice = await vscode.window.showWarningMessage(
+        'Are you sure you want to bulk clear old sessions? (This will keep your 3 most recent sessions)',
+        'Clear Old History', 'Cancel'
+      );
+      if (choice === 'Clear Old History') {
+        try {
+          await checkpointService.clearOldHistory(3);
+          historyProvider.refresh();
+          vscode.window.showInformationMessage('JGuard: Old session history cleared successfully.');
+        } catch (e: any) {
+          vscode.window.showErrorMessage(`Failed to clear history: ${e.message}`);
+        }
+      }
+    }),
+    vscode.commands.registerCommand('jguard.deleteHistorySession', async (item: HistorySessionTreeItem) => {
+      if (item && item.session) {
+        if (commands.getActiveSessionId() === item.session.id) {
+          vscode.window.showErrorMessage('You cannot delete the active session that you are currently protecting in your editor.');
+          return;
+        }
+
+        const choice = await vscode.window.showWarningMessage(
+          'Are you sure you want to delete this specific session? This will permanently delete its checkpoint data.',
+          'Delete Session', 'Cancel'
+        );
+        if (choice === 'Delete Session') {
+          try {
+            await checkpointService.deleteHistorySession(item.session.id);
+            historyProvider.refresh();
+            vscode.window.showInformationMessage('JGuard: Session deleted successfully.');
+          } catch (e: any) {
+            vscode.window.showErrorMessage(`Failed to delete session: ${e.message}`);
+          }
+        }
+      }
+    }),
+    vscode.commands.registerCommand('jguard.refreshHistory', () => {
+      historyProvider.refresh();
+    }),
+    vscode.commands.registerCommand('jguard.stashFile', async (item: any) => {
+      // The item is a GuardTreeItem representing a file change
+      if (item && item.change) {
+        const change = item.change;
+        // Fetch current and original hashes
+        const activeId = commands.getActiveSessionId();
+        if (!activeId) return;
+
+        // Pass to stashService
+        try {
+          await stashService.stashChange(
+            item.wsRoot || vscode.workspace.workspaceFolders![0].uri.fsPath, 
+            change.relativePath, 
+            change.type === 'created' ? null : change.checkpointHash, 
+            change.type === 'deleted' ? null : change.currentHash
+          );
+          
+          // Note: The active session tracks the file as pending, but now it matches original. 
+          // We can optionally refresh the active session change detector so the file disappears from the AI changes list
+          vscode.commands.executeCommand('jguard.refresh');
+          stashProvider.refresh();
+          vscode.window.showInformationMessage(`JGuard: Stashed ${change.relativePath}`);
+        } catch (e: any) {
+          vscode.window.showErrorMessage(`Failed to stash: ${e.message}`);
+        }
+      }
+    }),
+    vscode.commands.registerCommand('jguard.popStash', async (item: StashedChangeTreeItem) => {
+      if (item && item.stash) {
+        try {
+          await stashService.popStash(item.stash.id);
+          stashProvider.refresh();
+          vscode.window.showInformationMessage(`JGuard: Popped stash for ${item.stash.relativePath}`);
+        } catch (e: any) {
+          vscode.window.showErrorMessage(`Failed to pop stash: ${e.message}`);
+        }
+      }
+    }),
+    vscode.commands.registerCommand('jguard.applyStash', async (item: StashedChangeTreeItem) => {
+      if (item && item.stash) {
+        try {
+          await stashService.applyStash(item.stash.id);
+          vscode.window.showInformationMessage(`JGuard: Applied stash for ${item.stash.relativePath}`);
+        } catch (e: any) {
+          vscode.window.showErrorMessage(`Failed to apply stash: ${e.message}`);
+        }
+      }
+    }),
+    vscode.commands.registerCommand('jguard.dropStash', async (item: StashedChangeTreeItem) => {
+      if (item && item.stash) {
+        try {
+          await stashService.dropStash(item.stash.id);
+          stashProvider.refresh();
+          vscode.window.showInformationMessage(`JGuard: Dropped stash for ${item.stash.relativePath}`);
+        } catch (e: any) {
+          vscode.window.showErrorMessage(`Failed to drop stash: ${e.message}`);
+        }
       }
     })
   );

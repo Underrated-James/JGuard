@@ -59,6 +59,7 @@ export class CheckpointDetailWebview {
     let totalFiles = 0;
     let accepted = 0;
     let rejected = 0;
+    let pending = 0;
     
     for (const cp of Object.values(session.folderCheckpoints)) {
       totalFiles += Object.keys(cp.files).length;
@@ -68,7 +69,8 @@ export class CheckpointDetailWebview {
       for (const rootDecisions of Object.values(session.uiState.decisions)) {
         for (const decision of Object.values(rootDecisions)) {
           if (decision === 'accepted') accepted++;
-          if (decision === 'rejected') rejected++;
+          else if (decision === 'rejected') rejected++;
+          else if (decision === 'pending') pending++;
         }
       }
     }
@@ -178,6 +180,10 @@ export class CheckpointDetailWebview {
                 color: var(--vscode-testing-iconFailed); 
                 background-color: rgba(241, 76, 76, 0.15);
               }
+              .badge-pending { 
+                color: var(--vscode-testing-iconQueued); 
+                background-color: rgba(204, 204, 204, 0.15);
+              }
               .diff-btn {
                 font-size: 12px;
                 color: var(--vscode-textLink-foreground);
@@ -227,6 +233,10 @@ export class CheckpointDetailWebview {
                   <div class="stat-value" style="color: var(--vscode-testing-iconFailed);">${rejected}</div>
                   <div class="stat-label">Rejected Changes</div>
               </div>
+              <div class="stat-box">
+                  <div class="stat-value" style="color: var(--vscode-testing-iconQueued);">${pending}</div>
+                  <div class="stat-label">Pending Changes</div>
+              </div>
           </div>
           
           <div class="decisions-section">
@@ -264,9 +274,18 @@ export class CheckpointDetailWebview {
     for (const [wsRoot, rootDecisions] of Object.entries(session.uiState.decisions)) {
       const checkpoint = session.folderCheckpoints[wsRoot];
       for (const [filePath, decision] of Object.entries(rootDecisions)) {
-        const isAccepted = decision === 'accepted';
-        const badgeClass = isAccepted ? 'badge-accept' : 'badge-reject';
-        const icon = isAccepted ? '✓' : '✗';
+        let badgeClass = '';
+        let icon = '';
+        if (decision === 'accepted') {
+          badgeClass = 'badge-accept';
+          icon = '✓';
+        } else if (decision === 'rejected') {
+          badgeClass = 'badge-reject';
+          icon = '✗';
+        } else {
+          badgeClass = 'badge-pending';
+          icon = '○';
+        }
         const origHash = checkpoint?.files[filePath]?.hash || '';
         const aiHash = session.uiState?.aiSnapshotHashes?.[filePath] || '';
 

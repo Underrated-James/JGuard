@@ -85,3 +85,12 @@ export interface FileMeta {
 export interface IFileScanner {
   scan(folderUri?: any): Promise<Map<string, FileMeta>>;  // L1: optional folder scope
 }
+
+export interface StashedChange {
+  id: string; // unique stash ID
+  timestamp: number;
+  relativePath: string;
+  originalHash: string | null; // null if created by AI
+  stashedHash: string | null; // null if deleted by AI
+  workspaceRoot: string;
+}

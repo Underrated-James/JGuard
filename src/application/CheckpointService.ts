@@ -295,4 +295,69 @@ export class CheckpointService {
       console.error('GC error', e);
     }
   }
+
+  /**
+   * Manually clears old finalized sessions from history, keeping only the 3 most recent ones.
+   */
+  async clearOldHistory(keepCount: number = 3): Promise<void> {
+    const checkpointsDir = (this.metadataStore as any).getCheckpointsDir();
+    try {
+      const dirFiles = await fs.readdir(checkpointsDir);
+      const cpFiles = dirFiles.filter((f: string) => f.endsWith('.json'));
+      
+      const checkpoints: {id: string, createdAt: number, status: string}[] = [];
+      for (const f of cpFiles) {
+        const id = f.replace('.json', '');
+        const cp = await this.metadataStore.read(id);
+        checkpoints.push({ id, createdAt: cp.createdAt, status: cp.status });
+      }
+
+      // Sort descending (newest first)
+      checkpoints.sort((a, b) => b.createdAt - a.createdAt);
+
+      const finalized = checkpoints.filter(cp => cp.status !== 'active');
+      
+      let deletedCount = 0;
+      // Delete anything beyond keepCount
+      for (let i = keepCount; i < finalized.length; i++) {
+        await this.metadataStore.delete(finalized[i].id);
+        await this.metadataStore.deleteSession(finalized[i].id);
+        deletedCount++;
+      }
+      
+      // Run Garbage Collector immediately to free up disk space
+      if (this.gcEnabled && deletedCount > 0) {
+        const storageBaseDir = (this.metadataStore as any).storageBaseDir;
+        const gc = new BlobGarbageCollector(this.metadataStore, this.objectStore, storageBaseDir);
+        const gcResult = await gc.run();
+        console.log(`JGuard Manual GC: Deleted ${gcResult.deletedCount} orphaned blobs, freed ${(gcResult.bytesFreed / 1024 / 1024).toFixed(2)} MB`);
+      }
+    } catch (e) {
+      console.error('Failed to clear history', e);
+      throw e;
+    }
+  }
+
+  /**
+   * Deletes a specific finalized session from history.
+   */
+  async deleteHistorySession(sessionId: string): Promise<void> {
+    try {
+      const cp = await this.metadataStore.readSession(sessionId);
+
+      await this.metadataStore.delete(sessionId);
+      await this.metadataStore.deleteSession(sessionId);
+
+      // Run Garbage Collector immediately
+      if (this.gcEnabled) {
+        const storageBaseDir = (this.metadataStore as any).storageBaseDir;
+        const gc = new BlobGarbageCollector(this.metadataStore, this.objectStore, storageBaseDir);
+        const gcResult = await gc.run();
+        console.log(`JGuard: Deleted specific session ${sessionId}. GC freed ${(gcResult.bytesFreed / 1024 / 1024).toFixed(2)} MB`);
+      }
+    } catch (e) {
+      console.error(`Failed to delete session ${sessionId}`, e);
+      throw e;
+    }
+  }
 }

@@ -48,7 +48,7 @@ export class ObjectStore {
     await fs.mkdir(objDir, { recursive: true });
     
     // Write atomically using a temporary file
-    const tmpPath = `${objPath}.tmp.${Date.now()}`;
+    const tmpPath = `${objPath}.tmp.${Date.now()}.${Math.random().toString(36).substring(2)}`;
     await fs.writeFile(tmpPath, finalContent);
     await fs.rename(tmpPath, objPath);
 

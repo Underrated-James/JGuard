@@ -64,6 +64,41 @@
         "command": "jguard.showHistoryDetails",
         "title": "JGuard: View Session Details",
         "icon": "$(eye)"
+      },
+      {
+        "command": "jguard.clearHistory",
+        "title": "JGuard: Clear Session History",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "jguard.deleteHistorySession",
+        "title": "JGuard: Delete Session",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "jguard.refreshHistory",
+        "title": "JGuard: Refresh History",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "jguard.stashFile",
+        "title": "JGuard: Stash Change",
+        "icon": "$(archive)"
+      },
+      {
+        "command": "jguard.popStash",
+        "title": "JGuard: Pop Stash",
+        "icon": "$(arrow-up)"
+      },
+      {
+        "command": "jguard.applyStash",
+        "title": "JGuard: Apply Stash",
+        "icon": "$(chevron-right)"
+      },
+      {
+        "command": "jguard.dropStash",
+        "title": "JGuard: Drop Stash",
+        "icon": "$(trash)"
       }
     ],
     "viewsContainers": {
@@ -84,6 +119,10 @@
         {
           "id": "jguardHistory",
           "name": "Session History"
+        },
+        {
+          "id": "jguardStash",
+          "name": "Stashed Changes"
         }
       ]
     },
@@ -108,6 +147,16 @@
           "command": "jguard.finalize",
           "when": "view == jguardSidebar",
           "group": "navigation@4"
+        },
+        {
+          "command": "jguard.clearHistory",
+          "when": "view == jguardHistory",
+          "group": "navigation@2"
+        },
+        {
+          "command": "jguard.refreshHistory",
+          "when": "view == jguardHistory",
+          "group": "navigation@1"
         }
       ],
       "view/item/context": [
@@ -123,13 +172,39 @@
         },
         {
           "command": "jguard.toggleFile",
-          "when": "viewItem == jguard.changeItem || viewItem == jguard.changeItem.rejected",
+          "when": "viewItem == jguard.changeItem",
           "group": "inline@3"
         },
+        {
+          "command": "jguard.stashFile",
+          "when": "viewItem == jguard.changeItem",
+          "group": "inline@4"
+        },
+        {
+          "command": "jguard.popStash",
+          "when": "viewItem == jguard.stashedChangeItem",
+          "group": "inline@1"
+        },
+        {
+          "command": "jguard.applyStash",
+          "when": "viewItem == jguard.stashedChangeItem",
+          "group": "inline@2"
+        },
+        {
+          "command": "jguard.dropStash",
+          "when": "viewItem == jguard.stashedChangeItem",
+          "group": "inline@3"
+        },
+
         {
           "command": "jguard.showHistoryDetails",
           "when": "viewItem == jguard.historyItem",
           "group": "inline@1"
+        },
+        {
+          "command": "jguard.deleteHistorySession",
+          "when": "viewItem == jguard.historyItem",
+          "group": "inline@2"
         }
       ]
     },
@@ -174,6 +249,7 @@
     "vitest": "^1.4.0"
   },
   "dependencies": {
-    "diff": "^9.0.0"
+    "diff": "^9.0.0",
+    "ignore": "^7.0.6"
   }
 }

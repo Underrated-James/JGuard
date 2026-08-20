@@ -1,9 +1,13 @@
 import * as vscode from 'vscode';
 import { IFileScanner, FileMeta } from '../core/types';
 import * as fs from 'fs/promises';
+import { IgnoreManager } from '../core/IgnoreManager';
 
 export class WorkspaceScanner implements IFileScanner {
-  constructor(private excludePatterns: string[] = ['**/node_modules/**', '**/.git/**', '**/dist/**']) {}
+  constructor(
+    private ignoreManager: IgnoreManager,
+    private excludePatterns: string[] = ['**/node_modules/**', '**/.git/**', '**/dist/**', '**/build/**', '**/.angular/**', '**/target/**']
+  ) {}
 
   /**
    * Scans workspace files. 
@@ -28,6 +32,8 @@ export class WorkspaceScanner implements IFileScanner {
 
       for (const uri of uris) {
         if (uri.scheme === 'file') {
+          if (this.ignoreManager.isIgnored(uri.fsPath)) continue;
+
           const stat = await fs.stat(uri.fsPath);
           // relativePath is relative to the given folderUri
           const relativePath = vscode.workspace.asRelativePath(uri, false);
@@ -54,6 +60,8 @@ export class WorkspaceScanner implements IFileScanner {
 
         for (const uri of uris) {
           if (uri.scheme === 'file') {
+            if (this.ignoreManager.isIgnored(uri.fsPath)) continue;
+
             const stat = await fs.stat(uri.fsPath);
             // In multi-root workspaces, prefix with folder name to avoid path collisions
             const folderRelPath = vscode.workspace.asRelativePath(uri, isMultiRoot);

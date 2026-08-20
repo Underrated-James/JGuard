@@ -15,6 +15,7 @@ import { WorkspaceScanner } from './WorkspaceScanner';
 import { ObjectStore } from '../storage/ObjectStore';
 import { BatchedWatcherQueue } from './BatchedWatcherQueue';
 import { BranchWatcher } from './BranchWatcher';
+import { IgnoreManager } from '../core/IgnoreManager';
 
 export class Commands {
   // L1: Session-based state (multi-root)
@@ -40,6 +41,10 @@ export class Commands {
   private _onDidFinalizeSession = new vscode.EventEmitter<void>();
   public readonly onDidFinalizeSession = this._onDidFinalizeSession.event;
 
+  public getActiveSessionId(): string | undefined {
+    return this.activeSession?.id;
+  }
+
   private branchWatcher: BranchWatcher;
 
   constructor(
@@ -49,7 +54,8 @@ export class Commands {
     private scanner: WorkspaceScanner,
     private sidebar: SidebarProvider,
     private statusBar: StatusBar,
-    private objectStore: ObjectStore
+    private objectStore: ObjectStore,
+    private ignoreManager: IgnoreManager
   ) {
     this.branchWatcher = new BranchWatcher();
     this.context.subscriptions.push(this.branchWatcher);
@@ -88,6 +94,7 @@ export class Commands {
     });
 
     const onDidChange = (uri: vscode.Uri) => {
+      if (this.ignoreManager.isIgnored(uri.fsPath)) return;
       watcherQueue.enqueue(uri);
     };
     
@@ -192,6 +199,45 @@ export class Commands {
           changeSet.decisions[change.relativePath] = savedDecisions[change.relativePath];
         }
       }
+
+      // Retain files that were toggled or rejected (they match checkpoint on disk, so they were dropped by ChangeDetector)
+      if (existingCs) {
+        for (const change of existingCs.changes) {
+          if (!changeSet.changes.find(c => c.relativePath === change.relativePath)) {
+            const viewState = this.fileViewStates.get(change.relativePath);
+            const decision = existingCs.decisions[change.relativePath];
+            if (viewState === 'original' || decision === 'rejected') {
+              changeSet.changes.push(change);
+              if (existingCs.aiStateHashes[change.relativePath]) {
+                changeSet.aiStateHashes[change.relativePath] = existingCs.aiStateHashes[change.relativePath];
+              }
+              changeSet.decisions[change.relativePath] = decision;
+            }
+          }
+        }
+      } else if (savedDecisions && this.activeSession.uiState?.aiSnapshotHashes) {
+        for (const [relPath, decision] of Object.entries(savedDecisions)) {
+          const viewState = this.fileViewStates.get(relPath);
+          if (viewState === 'original' || decision === 'rejected') {
+            if (!changeSet.changes.find(c => c.relativePath === relPath)) {
+              const snapshot = checkpoint.files[relPath];
+              const aiHash = this.activeSession.uiState.aiSnapshotHashes[relPath];
+              const changeType = snapshot ? (aiHash ? 'modified' : 'deleted') : 'created';
+              
+              changeSet.changes.push({
+                type: changeType,
+                relativePath: relPath,
+                checkpointHash: snapshot?.hash,
+                currentHash: aiHash
+              });
+              if (aiHash) {
+                changeSet.aiStateHashes[relPath] = aiHash;
+              }
+              changeSet.decisions[relPath] = decision;
+            }
+          }
+        }
+      }
       
       this.changeSets.set(wsRoot, changeSet);
       totalCount += changeSet.changes.length;
@@ -243,6 +289,22 @@ export class Commands {
 
       if (checkpoint && existingCs) {
         const newChangeSet = await ChangeDetector.detectDelta(checkpoint, wsRoot, dirtyPaths, existingCs);
+        
+        // Retain toggled/rejected files that were dropped because they now match the checkpoint
+        for (const change of existingCs.changes) {
+          if (!newChangeSet.changes.find(c => c.relativePath === change.relativePath)) {
+            const viewState = this.fileViewStates.get(change.relativePath);
+            const decision = existingCs.decisions[change.relativePath];
+            if (viewState === 'original' || decision === 'rejected') {
+              newChangeSet.changes.push(change);
+              if (existingCs.aiStateHashes[change.relativePath]) {
+                newChangeSet.aiStateHashes[change.relativePath] = existingCs.aiStateHashes[change.relativePath];
+              }
+              newChangeSet.decisions[change.relativePath] = decision;
+            }
+          }
+        }
+        
         this.changeSets.set(wsRoot, newChangeSet);
       } else if (checkpoint && !existingCs) {
         // Fallback to full refresh if no existing changeset
