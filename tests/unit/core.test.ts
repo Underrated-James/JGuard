@@ -68,6 +68,7 @@ describe('Core Engine', () => {
 
     const scanner = new MockScanner(initialFiles, wsRoot);
     const service = new CheckpointService(metadataStore, objectStore, scanner, wsRoot);
+    service.setGCEnabled(false);
     
     // 1. Create checkpoint
     const cp = await service.createCheckpoint('ws-1');

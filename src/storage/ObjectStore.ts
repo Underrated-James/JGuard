@@ -1,6 +1,7 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { Hasher } from '../core/Hasher';
+import { ContentNormalizer } from '../core/ContentNormalizer';
 
 export class ObjectStore {
   constructor(private storageBaseDir: string) {}
@@ -23,11 +24,16 @@ export class ObjectStore {
 
   /**
    * Writes content to the object store if it doesn't already exist.
+   * L7: Normalizes text files to LF to avoid cross-OS discrepancies.
    * @param content The content to write.
+   * @param filePath Optional filepath to determine if it's text.
    * @returns The SHA-256 hash of the content.
    */
-  async write(content: Uint8Array): Promise<string> {
-    const hash = Hasher.hashBuffer(content);
+  async write(content: Uint8Array, filePath?: string): Promise<string> {
+    const buffer = Buffer.isBuffer(content) ? content : Buffer.from(content);
+    const finalContent = filePath ? ContentNormalizer.normalize(buffer, filePath) : buffer;
+    
+    const hash = Hasher.hashBuffer(finalContent); // The buffer is already normalized here
     const objPath = this.getObjectPath(hash);
     const objDir = this.getObjectDir(hash);
 
@@ -43,7 +49,7 @@ export class ObjectStore {
     
     // Write atomically using a temporary file
     const tmpPath = `${objPath}.tmp.${Date.now()}`;
-    await fs.writeFile(tmpPath, content);
+    await fs.writeFile(tmpPath, finalContent);
     await fs.rename(tmpPath, objPath);
 
     return hash;

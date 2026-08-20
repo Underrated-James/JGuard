@@ -59,13 +59,31 @@
         "command": "jguard.finalize",
         "title": "JGuard: Finalize Session",
         "icon": "$(pass-filled)"
+      },
+      {
+        "command": "jguard.showHistoryDetails",
+        "title": "JGuard: View Session Details",
+        "icon": "$(eye)"
       }
     ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "jguard-container",
+          "title": "JGuard",
+          "icon": "$(shield)"
+        }
+      ]
+    },
     "views": {
-      "explorer": [
+      "jguard-container": [
         {
           "id": "jguardSidebar",
-          "name": "AI Guard"
+          "name": "Active Session"
+        },
+        {
+          "id": "jguardHistory",
+          "name": "Session History"
         }
       ]
     },
@@ -107,6 +125,11 @@
           "command": "jguard.toggleFile",
           "when": "viewItem == jguard.changeItem || viewItem == jguard.changeItem.rejected",
           "group": "inline@3"
+        },
+        {
+          "command": "jguard.showHistoryDetails",
+          "when": "viewItem == jguard.historyItem",
+          "group": "inline@1"
         }
       ]
     },
@@ -117,6 +140,11 @@
           "type": "number",
           "default": 5,
           "description": "Minutes after accepting changes during which you can undo the accept."
+        },
+        "jguard.enableGarbageCollection": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable automatic garbage collection of orphaned checkpoint files."
         }
       }
     }
@@ -134,14 +162,18 @@
     "test": "vitest run"
   },
   "devDependencies": {
+    "@types/diff": "^7.0.2",
     "@types/node": "20.x",
     "@types/vscode": "^1.80.0",
     "@typescript-eslint/eslint-plugin": "^7.0.0",
     "@typescript-eslint/parser": "^7.0.0",
+    "@vscode/test-electron": "^2.3.9",
     "esbuild": "^0.20.0",
     "eslint": "^8.56.0",
     "typescript": "^5.3.3",
-    "vitest": "^1.4.0",
-    "@vscode/test-electron": "^2.3.9"
+    "vitest": "^1.4.0"
+  },
+  "dependencies": {
+    "diff": "^9.0.0"
   }
 }

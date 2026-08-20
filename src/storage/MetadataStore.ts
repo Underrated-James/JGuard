@@ -100,4 +100,28 @@ export class MetadataStore {
       }
     }
   }
+
+  /**
+   * Lists all checkpoint IDs.
+   */
+  async listCheckpoints(): Promise<string[]> {
+    try {
+      const files = await fs.readdir(this.getCheckpointsDir());
+      return files.filter(f => f.endsWith('.json')).map(f => f.replace('.json', ''));
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Lists all session IDs.
+   */
+  async listSessions(): Promise<string[]> {
+    try {
+      const files = await fs.readdir(this.getSessionsDir());
+      return files.filter(f => f.endsWith('.json')).map(f => f.replace('.json', ''));
+    } catch {
+      return [];
+    }
+  }
 }

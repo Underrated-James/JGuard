@@ -81,4 +81,93 @@ export class ChangeDetector {
       decisions,
     };
   }
+
+  /**
+   * L4: Computes incremental O(k) updates to a ChangeSet for specific dirty paths.
+   * @param checkpoint The active checkpoint.
+   * @param workspaceRoot Absolute path to the workspace root.
+   * @param dirtyPaths Array of relative paths that were modified.
+   * @param existingChangeSet The previous ChangeSet to update.
+   */
+  static async detectDelta(
+    checkpoint: Checkpoint,
+    workspaceRoot: string,
+    dirtyPaths: string[],
+    existingChangeSet: ChangeSet
+  ): Promise<ChangeSet> {
+    const newChangeSet: ChangeSet = {
+      checkpointId: existingChangeSet.checkpointId,
+      computedAt: Date.now(),
+      changes: [...existingChangeSet.changes],
+      aiStateHashes: { ...existingChangeSet.aiStateHashes },
+      decisions: { ...existingChangeSet.decisions },
+    };
+
+    for (const relPath of dirtyPaths) {
+      const absPath = path.join(workspaceRoot, relPath);
+      
+      // Remove any existing change for this path
+      newChangeSet.changes = newChangeSet.changes.filter(c => c.relativePath !== relPath);
+      delete newChangeSet.aiStateHashes[relPath];
+
+      let currentHash: string | null = null;
+      let exists = false;
+      
+      try {
+        currentHash = await Hasher.hashFile(absPath);
+        exists = true;
+      } catch (e: any) {
+        if (e.code === 'ENOENT') {
+          exists = false;
+        } else {
+          throw e; // Unexpected error
+        }
+      }
+
+      const snapshot = checkpoint.files[relPath];
+
+      if (snapshot) {
+        if (!exists) {
+          // File was in checkpoint but deleted now
+          newChangeSet.changes.push({
+            type: 'deleted',
+            relativePath: relPath,
+            checkpointHash: snapshot.hash,
+          });
+          newChangeSet.decisions[relPath] = newChangeSet.decisions[relPath] ?? 'pending';
+        } else if (currentHash !== snapshot.hash) {
+          // File was in checkpoint and modified
+          newChangeSet.changes.push({
+            type: 'modified',
+            relativePath: relPath,
+            checkpointHash: snapshot.hash,
+            currentHash: currentHash!,
+          });
+          newChangeSet.aiStateHashes[relPath] = currentHash!;
+          newChangeSet.decisions[relPath] = newChangeSet.decisions[relPath] ?? 'pending';
+        }
+      } else {
+        if (exists) {
+          // File was not in checkpoint and was created
+          newChangeSet.changes.push({
+            type: 'created',
+            relativePath: relPath,
+            currentHash: currentHash!,
+          });
+          newChangeSet.aiStateHashes[relPath] = currentHash!;
+          newChangeSet.decisions[relPath] = newChangeSet.decisions[relPath] ?? 'pending';
+        }
+      }
+    }
+
+    // Clean up decisions for files that no longer have changes
+    const currentChangePaths = new Set(newChangeSet.changes.map(c => c.relativePath));
+    for (const p of Object.keys(newChangeSet.decisions)) {
+      if (!currentChangePaths.has(p)) {
+        delete newChangeSet.decisions[p];
+      }
+    }
+
+    return newChangeSet;
+  }
 }

@@ -4,14 +4,21 @@ import { ObjectStore } from '../storage/ObjectStore';
 import { MetadataStore } from '../storage/MetadataStore';
 import * as path from 'path';
 import * as fs from 'fs/promises';
+import { BlobGarbageCollector } from './BlobGarbageCollector';
 
 export class CheckpointService {
+  private gcEnabled: boolean = true;
+
   constructor(
     private metadataStore: MetadataStore,
     private objectStore: ObjectStore,
     private scanner: IFileScanner,
     private workspaceRoot: string
   ) {}
+
+  setGCEnabled(enabled: boolean) {
+    this.gcEnabled = enabled;
+  }
 
   /**
    * Generates a simple unique ID (ulid alternative)
@@ -65,6 +72,9 @@ export class CheckpointService {
       status: 'active',
     };
 
+    // Save session to metadata store
+    await this.metadataStore.writeSession(sessionId, session);
+
     // Write a lock file with session ID
     const lockFile = path.join((this.metadataStore as any).storageBaseDir, 'jguard.lock');
     await fs.writeFile(lockFile, sessionId, 'utf-8');
@@ -105,7 +115,7 @@ export class CheckpointService {
         batch.map(async ([relPath, meta]) => {
           const absPath = path.join(folderRoot, relPath);
           const content: Uint8Array = await fs.readFile(absPath);
-          const hash = await this.objectStore.write(content);
+          const hash = await this.objectStore.write(content, absPath);
           return { relPath, hash, meta, isBinary: this.isBinary(content) };
         })
       );
@@ -242,18 +252,21 @@ export class CheckpointService {
       const dirFiles = await fs.readdir(checkpointsDir);
       const cpFiles = dirFiles.filter((f: string) => f.endsWith('.json'));
       
-      const checkpoints: {id: string, createdAt: number, finalizedAt?: number}[] = [];
+      const checkpoints: {id: string, createdAt: number, status: string, finalizedAt?: number}[] = [];
       for (const f of cpFiles) {
         const id = f.replace('.json', '');
         const cp = await this.metadataStore.read(id);
-        checkpoints.push({ id, createdAt: cp.createdAt, finalizedAt: cp.finalizedAt });
+        checkpoints.push({ id, createdAt: cp.createdAt, status: cp.status, finalizedAt: cp.finalizedAt });
       }
 
       // Sort descending (newest first)
       checkpoints.sort((a, b) => b.createdAt - a.createdAt);
 
-      // Filter out grace-period-protected checkpoints
+      // Filter out active checkpoints and grace-period-protected checkpoints
       const deletable = checkpoints.filter(cp => {
+        if (cp.status === 'active') {
+          return false; // Active checkpoints must never be deleted
+        }
         if (cp.finalizedAt && (now - cp.finalizedAt) < GRACE_PERIOD) {
           return false; // Protected by grace period
         }
@@ -263,9 +276,23 @@ export class CheckpointService {
       // Delete anything beyond keepCount from the deletable list
       for (let i = keepCount; i < deletable.length; i++) {
         await this.metadataStore.delete(deletable[i].id);
+        // Also delete session if there is one
+        await this.metadataStore.deleteSession(deletable[i].id);
       }
+      
+      // L4: Run BlobGarbageCollector
+      if (this.gcEnabled) {
+        const storageBaseDir = (this.metadataStore as any).storageBaseDir;
+        const gc = new BlobGarbageCollector(this.metadataStore, this.objectStore, storageBaseDir);
+        const { deletedCount, bytesFreed } = await gc.run();
+        if (deletedCount > 0) {
+          console.log(`JGuard GC: Deleted ${deletedCount} orphaned blobs, freed ${(bytesFreed / 1024 / 1024).toFixed(2)} MB`);
+        }
+      }
+      
     } catch (e) {
       // Ignore errors during GC
+      console.error('GC error', e);
     }
   }
 }

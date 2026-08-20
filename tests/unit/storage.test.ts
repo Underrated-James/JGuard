@@ -89,4 +89,43 @@ describe('Storage Engine', () => {
       expect(readCp).toEqual(cp);
     });
   });
+
+  describe('BlobGarbageCollector', () => {
+    it('should retain reachable blobs from sessions and delete orphaned ones', async () => {
+      const { BlobGarbageCollector } = await import('../../src/application/BlobGarbageCollector');
+      const objStore = new ObjectStore(tmpDir);
+      await objStore.initialize();
+      const metaStore = new MetadataStore(tmpDir);
+      await metaStore.initialize();
+
+      const hash1 = await objStore.write(Buffer.from('live content 1'));
+      const hash2 = await objStore.write(Buffer.from('orphaned content 2'));
+
+      // Create a session referencing hash1
+      await metaStore.writeSession('session-1', {
+        id: 'session-1',
+        createdAt: Date.now(),
+        status: 'active',
+        folderCheckpoints: {
+          [tmpDir]: {
+            id: 'cp-1',
+            workspaceId: 'ws-1',
+            createdAt: Date.now(),
+            status: 'active',
+            workspaceRoot: tmpDir,
+            files: {
+              'file1.txt': { hash: hash1, size: 14, mtime: Date.now(), isBinary: false }
+            }
+          }
+        }
+      });
+
+      const gc = new BlobGarbageCollector(metaStore, objStore, tmpDir);
+      const { deletedCount } = await gc.run();
+
+      expect(deletedCount).toBe(1);
+      expect(await objStore.exists(hash1)).toBe(true);
+      expect(await objStore.exists(hash2)).toBe(false);
+    });
+  });
 });

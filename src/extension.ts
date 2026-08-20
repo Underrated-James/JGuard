@@ -8,6 +8,9 @@ import { StatusBar } from './vscode/StatusBar';
 import { SidebarProvider } from './vscode/Sidebar';
 import { DiffProvider } from './vscode/DiffProvider';
 import { Commands } from './vscode/Commands';
+import { HistoryTreeProvider, HistorySessionTreeItem } from './vscode/HistoryTreeProvider';
+import { CheckpointDetailWebview } from './vscode/CheckpointDetailWebview';
+import { JGuardCodeLensProvider } from './vscode/CodeLensProvider';
 import * as path from 'path';
 import * as fs from 'fs/promises';
 
@@ -35,18 +38,55 @@ export async function activate(context: vscode.ExtensionContext) {
   const checkpointService = new CheckpointService(metadataStore, objectStore, scanner, wsRoot);
   const restoreService = new RestoreService(objectStore);
 
+  // Read GC config
+  const gcEnabled = vscode.workspace.getConfiguration('jguard').get<boolean>('enableGarbageCollection', true);
+  checkpointService.setGCEnabled(gcEnabled);
+
+  // Listen for config changes
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration(e => {
+      if (e.affectsConfiguration('jguard.enableGarbageCollection')) {
+        const enabled = vscode.workspace.getConfiguration('jguard').get<boolean>('enableGarbageCollection', true);
+        checkpointService.setGCEnabled(enabled);
+      }
+    })
+  );
+
   // UI Setup
   statusBar = new StatusBar();
   const sidebar = new SidebarProvider();
+  const historyProvider = new HistoryTreeProvider(metadataStore);
   const diffProvider = new DiffProvider(objectStore);
 
   // Register providers
   vscode.window.registerTreeDataProvider('jguardSidebar', sidebar);
+  vscode.window.registerTreeDataProvider('jguardHistory', historyProvider);
   vscode.workspace.registerTextDocumentContentProvider(DiffProvider.scheme, diffProvider);
 
   // Register commands — L2/L6: now receives objectStore for per-file snapshots and binary diffs
   commands = new Commands(context, checkpointService, restoreService, scanner, sidebar, statusBar, objectStore);
   commands.register();
+
+  // Register CodeLensProvider
+  const codeLensProvider = new JGuardCodeLensProvider(commands, objectStore);
+  vscode.languages.registerCodeLensProvider({ scheme: 'file' }, codeLensProvider);
+
+  // Register History Command
+  context.subscriptions.push(
+    vscode.commands.registerCommand('jguard.showHistoryDetails', (item: HistorySessionTreeItem) => {
+      if (item && item.session) {
+        CheckpointDetailWebview.show(context, item.session);
+      }
+    })
+  );
+
+
+  // Refresh history when a session is finalized
+  context.subscriptions.push(
+    commands.onDidFinalizeSession(() => {
+      historyProvider.refresh();
+    })
+  );
 
   // Crash Recovery — L1: lockfile now stores session IDs
   const lockFile = path.join(storageBaseDir, 'jguard.lock');

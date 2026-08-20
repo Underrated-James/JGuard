@@ -13,6 +13,8 @@ import { SidebarProvider } from './Sidebar';
 import { StatusBar } from './StatusBar';
 import { WorkspaceScanner } from './WorkspaceScanner';
 import { ObjectStore } from '../storage/ObjectStore';
+import { BatchedWatcherQueue } from './BatchedWatcherQueue';
+import { BranchWatcher } from './BranchWatcher';
 
 export class Commands {
   // L1: Session-based state (multi-root)
@@ -35,6 +37,11 @@ export class Commands {
   // Bulk view state for backward-compat bulk toggle
   private viewState: 'ai' | 'original' = 'ai';
 
+  private _onDidFinalizeSession = new vscode.EventEmitter<void>();
+  public readonly onDidFinalizeSession = this._onDidFinalizeSession.event;
+
+  private branchWatcher: BranchWatcher;
+
   constructor(
     private context: vscode.ExtensionContext,
     private checkpointService: CheckpointService,
@@ -43,7 +50,19 @@ export class Commands {
     private sidebar: SidebarProvider,
     private statusBar: StatusBar,
     private objectStore: ObjectStore
-  ) {}
+  ) {
+    this.branchWatcher = new BranchWatcher();
+    this.context.subscriptions.push(this.branchWatcher);
+    
+    this.context.subscriptions.push(
+      this.branchWatcher.onBranchChanged(async (wsRoot) => {
+        if (this.activeSession && this.activeSession.folderCheckpoints[wsRoot]) {
+          vscode.window.showWarningMessage('Git branch switch detected. Finalizing JGuard session to prevent conflicts.');
+          await this.acceptAll(); // Auto-accept to avoid reverting the branch checkout
+        }
+      })
+    );
+  }
 
   register() {
     this.context.subscriptions.push(
@@ -62,17 +81,22 @@ export class Commands {
     );
 
     const watcher = vscode.workspace.createFileSystemWatcher('**/*');
-    const onDidChange = async () => {
+    const watcherQueue = new BatchedWatcherQueue(200, 50, async (uris) => {
       if (this.activeSession) {
-        await this.refresh();
+        await this.deltaRefresh(uris);
       }
+    });
+
+    const onDidChange = (uri: vscode.Uri) => {
+      watcherQueue.enqueue(uri);
     };
     
     this.context.subscriptions.push(
       watcher.onDidChange(onDidChange),
       watcher.onDidCreate(onDidChange),
       watcher.onDidDelete(onDidChange),
-      watcher
+      watcher,
+      { dispose: () => watcherQueue.dispose() }
     );
   }
 
@@ -81,6 +105,10 @@ export class Commands {
    */
   restoreSessionState(session: CheckpointSession) {
     this.activeSession = session;
+    if (session.uiState) {
+      this.fileViewStates = new Map(Object.entries(session.uiState.fileViewStates || {}));
+      this.aiSnapshotHashes = new Map(Object.entries(session.uiState.aiSnapshotHashes || {}));
+    }
   }
 
   private async toggleProtection() {
@@ -145,20 +173,23 @@ export class Commands {
   async refresh() {
     if (!this.activeSession) return;
     
-    // L1: Detect changes for each workspace folder
+    // Save previous decisions in memory before clearing
+    const previousChangeSets = new Map(this.changeSets);
     this.changeSets.clear();
     let totalCount = 0;
 
     for (const [wsRoot, checkpoint] of Object.entries(this.activeSession.folderCheckpoints)) {
       const changeSet = await ChangeDetector.detectChanges(checkpoint, this.scanner, wsRoot);
       
-      // Preserve existing decisions for files that haven't changed
-      const existingCs = this.changeSets.get(wsRoot);
-      if (existingCs) {
-        for (const change of changeSet.changes) {
-          if (existingCs.decisions[change.relativePath]) {
-            changeSet.decisions[change.relativePath] = existingCs.decisions[change.relativePath];
-          }
+      // Preserve existing decisions for files across refreshes
+      const existingCs = previousChangeSets.get(wsRoot);
+      const savedDecisions = this.activeSession.uiState?.decisions?.[wsRoot];
+      
+      for (const change of changeSet.changes) {
+        if (existingCs && existingCs.decisions[change.relativePath] && existingCs.decisions[change.relativePath] !== 'pending') {
+          changeSet.decisions[change.relativePath] = existingCs.decisions[change.relativePath];
+        } else if (savedDecisions && savedDecisions[change.relativePath] && savedDecisions[change.relativePath] !== 'pending') {
+          changeSet.decisions[change.relativePath] = savedDecisions[change.relativePath];
         }
       }
       
@@ -174,6 +205,65 @@ export class Commands {
     
     // L1: Pass all changesets to sidebar for grouped display
     this.sidebar.refresh(this.changeSets, true, false, this.fileViewStates);
+    
+    // Save state after refresh detects new changes
+    await this.saveUIState();
+  }
+
+  /**
+   * L4: Incremental refresh based on specific changed URIs.
+   */
+  private async deltaRefresh(uris: vscode.Uri[]) {
+    if (!this.activeSession) return;
+
+    const changesByRoot = new Map<string, string[]>();
+
+    for (const uri of uris) {
+      if (uri.scheme !== 'file') continue;
+      
+      const wsRoot = this.findWorkspaceRootForFileAbsolute(uri.fsPath);
+      if (wsRoot) {
+        // Convert to relative path without OS separators leaking into keys if possible,
+        // but Node's path.relative handles separators on the platform side.
+        const relPath = path.relative(wsRoot, uri.fsPath).replace(/\\/g, '/');
+        let list = changesByRoot.get(wsRoot);
+        if (!list) {
+          list = [];
+          changesByRoot.set(wsRoot, list);
+        }
+        list.push(relPath);
+      }
+    }
+
+    let totalCount = 0;
+
+    for (const [wsRoot, dirtyPaths] of changesByRoot.entries()) {
+      const checkpoint = this.activeSession.folderCheckpoints[wsRoot];
+      const existingCs = this.changeSets.get(wsRoot);
+
+      if (checkpoint && existingCs) {
+        const newChangeSet = await ChangeDetector.detectDelta(checkpoint, wsRoot, dirtyPaths, existingCs);
+        this.changeSets.set(wsRoot, newChangeSet);
+      } else if (checkpoint && !existingCs) {
+        // Fallback to full refresh if no existing changeset
+        const changeSet = await ChangeDetector.detectChanges(checkpoint, this.scanner, wsRoot);
+        this.changeSets.set(wsRoot, changeSet);
+      }
+    }
+
+    for (const cs of this.changeSets.values()) {
+      totalCount += cs.changes.length;
+    }
+
+    if (totalCount > 0) {
+      this.statusBar.setState('changes', totalCount);
+    } else {
+      this.statusBar.setState('protecting');
+    }
+    this.sidebar.refresh(this.changeSets, true, false, this.fileViewStates);
+    
+    // Save state after delta refresh detects new changes
+    await this.saveUIState();
   }
 
   private async openDiff(change: FileChange) {
@@ -285,8 +375,9 @@ export class Commands {
 
   // ─── L2: Per-File Accept ─────────────────────────────────────────────
 
-  private async acceptFile(change: FileChange) {
+  private async acceptFile(arg: any) {
     if (!this.activeSession) return;
+    const change: FileChange = arg.change ? arg.change : arg;
 
     const wsRoot = this.findWorkspaceRootForFile(change.relativePath);
     if (!wsRoot) return;
@@ -297,12 +388,15 @@ export class Commands {
     cs.decisions[change.relativePath] = 'accepted';
     this.sidebar.refresh(this.changeSets, true, false, this.fileViewStates);
     vscode.window.showInformationMessage(`✓ Accepted: ${change.relativePath}`);
+    
+    await this.saveUIState();
   }
 
   // ─── L2: Per-File Reject (Immediate + Auto-Snapshot) ─────────────────
 
-  private async rejectFile(change: FileChange) {
+  private async rejectFile(arg: any) {
     if (!this.activeSession) return;
+    const change: FileChange = arg.change ? arg.change : arg;
 
     const wsRoot = this.findWorkspaceRootForFile(change.relativePath);
     if (!wsRoot) return;
@@ -318,7 +412,7 @@ export class Commands {
       const absPath = path.join(wsRoot, change.relativePath);
       if (change.type !== 'deleted') {
         const aiContent: Uint8Array = await fs.readFile(absPath);
-        const aiHash = await this.objectStore.write(aiContent);
+        const aiHash = await this.objectStore.write(aiContent, absPath);
         this.aiSnapshotHashes.set(change.relativePath, aiHash);
       }
 
@@ -338,6 +432,8 @@ export class Commands {
 
       this.sidebar.refresh(this.changeSets, true, false, this.fileViewStates);
       vscode.window.showInformationMessage(`✗ Rejected: ${change.relativePath} (AI version saved — toggle back anytime)`);
+      
+      await this.saveUIState();
     } catch (err: any) {
       vscode.window.showErrorMessage(`Failed to reject ${change.relativePath}: ${err.message}`);
     }
@@ -345,8 +441,9 @@ export class Commands {
 
   // ─── L3: Per-File Toggle ─────────────────────────────────────────────
 
-  private async toggleFile(change: FileChange) {
+  private async toggleFile(arg: any) {
     if (!this.activeSession) return;
+    const change: FileChange = arg.change ? arg.change : arg;
 
     const wsRoot = this.findWorkspaceRootForFile(change.relativePath);
     if (!wsRoot) return;
@@ -364,7 +461,7 @@ export class Commands {
         const absPath = path.join(wsRoot, change.relativePath);
         if (change.type !== 'deleted') {
           const aiContent: Uint8Array = await fs.readFile(absPath);
-          const aiHash = await this.objectStore.write(aiContent);
+          const aiHash = await this.objectStore.write(aiContent, absPath);
           this.aiSnapshotHashes.set(change.relativePath, aiHash);
         }
 
@@ -400,6 +497,7 @@ export class Commands {
       }
 
       this.sidebar.refresh(this.changeSets, true, false, this.fileViewStates);
+      await this.saveUIState();
     } catch (err: any) {
       vscode.window.showErrorMessage(`Toggle failed for ${change.relativePath}: ${err.message}`);
     }
@@ -430,6 +528,19 @@ export class Commands {
       }
     }
 
+    // Save final decisions to session
+    await this.saveUIState();
+
+    const session = this.activeSession;
+    session.status = 'accepted';
+    session.finalizedAt = Date.now();
+    for (const cp of Object.values(session.folderCheckpoints)) {
+      cp.status = 'accepted';
+      cp.finalizedAt = session.finalizedAt;
+      await this.checkpointService.updateCheckpoint(cp);
+    }
+    await this.checkpointService.updateSession(session);
+
     await this.cleanupSession();
     vscode.window.showInformationMessage('AI Guard: Session finalized.');
   }
@@ -450,6 +561,7 @@ export class Commands {
 
     // Mark all as accepted
     this.markAllPending('accepted');
+    await this.saveUIState();
 
     // L7: Soft-delete with grace period
     const session = this.activeSession;
@@ -458,6 +570,7 @@ export class Commands {
 
     // Update session status
     session.status = 'accepted';
+    session.finalizedAt = this.lastFinalizedAt;
     for (const cp of Object.values(session.folderCheckpoints)) {
       cp.status = 'accepted';
       cp.finalizedAt = this.lastFinalizedAt;
@@ -512,6 +625,13 @@ export class Commands {
       }
     }
 
+    this.markAllPending('rejected');
+    await this.saveUIState();
+
+    this.activeSession.status = 'rejected';
+    this.activeSession.finalizedAt = Date.now();
+    await this.checkpointService.updateSession(this.activeSession);
+
     await this.cleanupSession();
     vscode.window.showInformationMessage('AI Guard: Checkpoint discarded and safely reverted.');
   }
@@ -549,6 +669,23 @@ export class Commands {
 
   // ─── Internal Helpers ────────────────────────────────────────────────
 
+  private async saveUIState() {
+    if (!this.activeSession) return;
+    
+    const decisions: Record<string, Record<string, FileDecision>> = {};
+    for (const [wsRoot, cs] of this.changeSets.entries()) {
+      decisions[wsRoot] = { ...cs.decisions };
+    }
+
+    this.activeSession.uiState = {
+      decisions,
+      fileViewStates: Object.fromEntries(this.fileViewStates),
+      aiSnapshotHashes: Object.fromEntries(this.aiSnapshotHashes)
+    };
+
+    await this.checkpointService.updateSession(this.activeSession);
+  }
+
   private async executeRestore(cp: Checkpoint, cs: ChangeSet, conflicts: any[], wsFolder: string) {
     this.statusBar.setState('restoring');
     const plan = RestorePlanner.buildPlan(cp, cs, conflicts, wsFolder);
@@ -580,6 +717,9 @@ export class Commands {
     this.statusBar.setState('off');
     this.sidebar.refresh(null, false);
     await this.clearLockFile();
+    
+    // Notify history provider to refresh
+    this._onDidFinalizeSession.fire();
   }
 
   private async clearLockFile() {
@@ -619,6 +759,20 @@ export class Commands {
     // Fallback to first folder
     const folders = vscode.workspace.workspaceFolders;
     return folders && folders.length > 0 ? folders[0].uri.fsPath : null;
+  }
+
+  private findWorkspaceRootForFileAbsolute(absolutePath: string): string | null {
+    const folders = vscode.workspace.workspaceFolders;
+    if (!folders) return null;
+
+    let bestMatch: string | null = null;
+    for (const folder of folders) {
+      const root = folder.uri.fsPath;
+      if (absolutePath.startsWith(root) && (!bestMatch || root.length > bestMatch.length)) {
+        bestMatch = root;
+      }
+    }
+    return bestMatch;
   }
 
   private getTotalChangeCount(): number {

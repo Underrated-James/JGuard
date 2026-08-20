@@ -25,6 +25,14 @@ export interface CheckpointSession {
   createdAt: number;
   folderCheckpoints: Record<string, Checkpoint>; // wsRoot → Checkpoint
   status: 'active' | 'accepted' | 'rejected';
+  uiState?: SessionUIState; // L5: Persist UI decisions/state for crash recovery
+  finalizedAt?: number; // L7: When session was accepted or rejected
+}
+
+export interface SessionUIState {
+  aiSnapshotHashes: Record<string, string>; // relPath → hash
+  fileViewStates: Record<string, FileViewState>; // relPath → viewState
+  decisions: Record<string, Record<string, FileDecision>>; // wsRoot → relPath → decision
 }
 
 export type FileChange = 
